@@ -1,0 +1,174 @@
+
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Pixel Canvas</title>
+    <style>
+    body {
+      font-family: system-ui, sans-serif;
+      text-align: center;
+      margin: 24px;
+    }
+
+    .controls {
+      margin: 16px;
+      display: flex;
+      justify-content: center;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    canvas {
+      width: min(80vw, 700px);
+      height: min(80vw, 700px);
+      border: 1px solid #777;
+      image-rendering: pixelated;
+      cursor: crosshair;
+      touch-action: none;
+    }
+
+    button, input {
+      padding: 8px;
+    }
+  </style>
+  </head>
+  <body>
+    <h1>Collaborative Pixel Canvas</h1>
+
+    <div class="controls">
+      <label>
+        Colour:
+        <input id="color" type="color" value="#ff0000">
+      </label>
+      <button id="clear">Clear canvas</button>
+    </div>
+
+    <canvas id="canvas" width="1000" height="1000"></canvas>
+    <p id="status">Connecting...</p>
+
+    <script>
+    const canvas = document.getElementById("canvas");
+    const ctx = canvas.getContext("2d");
+    const colorInput = document.getElementById("color");
+    const status = document.getElementById("status");
+
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, 1000, 1000);
+
+    function paint(x, y, color) {
+      ctx.fillStyle = color;
+      // Enlarge each logical pixel for visibility.
+      ctx.fillRect(x, y, 3, 3);
+    }
+
+    async function loadState() {
+      const response = await fetch("/state");
+      if (!response.ok) throw new Error("Could not load canvas");
+      const data = await response.json();
+
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, 1000, 1000);
+
+      for (const [key, color] of Object.entries(data.pixels)) {
+        const [x, y] = key.split(",").map(Number);
+        paint(x, y, color);
+      }
+
+      status.textContent = "Canvas loaded";
+    }
+    
+        
+    const wsProtocol =
+      window.location.protocol === "https:" ? "wss:" : "ws:";
+
+    const socket = new WebSocket(
+      `${wsProtocol}//${window.location.host}/ws`
+    );
+
+    socket.addEventListener("open", () => {
+      status.textContent = "Connected — live collaboration enabled";
+    });
+
+    socket.addEventListener("message", (event) => {
+      const message = JSON.parse(event.data);
+
+      if (message.type === "state") {
+        ctx.fillStyle = "#ffffff";
+        ctx.fillRect(0, 0, 1000, 1000);
+
+        for (const [key, color] of Object.entries(message.pixels)) {
+          const [x, y] = key.split(",").map(Number);
+          paint(x, y, color);
+        }
+      }
+
+      if (message.type === "draw") {
+        paint(message.x, message.y, message.color);
+      }
+
+      if (message.type === "clear") {
+        ctx.fillStyle = "#ffffff";
+        ctx.fillRect(0, 0, 1000, 1000);
+      }
+    });
+
+    socket.addEventListener("close", () => {
+      status.textContent = "Disconnected — refresh to reconnect";
+    });
+
+    socket.addEventListener("error", () => {
+      status.textContent = "WebSocket connection error";
+    });
+
+
+    canvas.addEventListener("pointerdown", async (event) => {
+      const rect = canvas.getBoundingClientRect();
+      const x = Math.floor(
+        (event.clientX - rect.left) / rect.width * 1000
+      );
+      const y = Math.floor(
+        (event.clientY - rect.top) / rect.height * 1000
+      );
+
+      const color = colorInput.value;
+
+      try {
+        const response = await fetch("/draw", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ x, y, color })
+        });
+
+        if (!response.ok) throw new Error("Drawing failed");
+
+        paint(x, y, color);
+        status.textContent = `Painted (${x}, ${y})`;
+      } catch (error) {
+        status.textContent = "Error: " + error.message;
+      }
+    });
+
+    document.getElementById("clear").addEventListener(
+      "click", async () => {
+        const response = await fetch("/clear", { method: "DELETE" });
+
+        if (!response.ok) {
+          status.textContent = "Could not clear canvas";
+          return;
+        }
+
+        ctx.fillStyle = "#ffffff";
+        ctx.fillRect(0, 0, 1000, 1000);
+        status.textContent = "Canvas cleared";
+      }
+    );
+
+    loadState().catch(error => {
+      status.textContent = "Error: " + error.message;
+    });
+  </script>
+  </body>
+</html>

@@ -6,14 +6,42 @@ from starlette.websockets import WebSocketDisconnect
 from starlette.requests import Request as StarletteRequest
 
 from frontend import main
+from shared.tiles import configured_shard_ids, shard_for_tile, tile_for_pixel
 
 
 @pytest.fixture(autouse=True)
-def reset_memory_state():
+def reset_memory_state(monkeypatch):
     main.pixels.clear()
     main.sessions.clear()
     main.manager.active_connections.clear()
     main.canvas_lock = asyncio.Lock()
+    shard_pixels = {shard_id: {} for shard_id in configured_shard_ids()}
+
+    async def fake_request_shard(shard_id, method, path, *, params=None, body=None):
+        records = shard_pixels[shard_id]
+        if path != "/pixels":
+            raise AssertionError(f"Unexpected shard path: {path}")
+        if method == "POST":
+            tile = tile_for_pixel(body["x"], body["y"])
+            assert body["tile_id"] == tile.tile_id
+            assert shard_for_tile(tile) == shard_id
+            record = {
+                "x": body["x"], "y": body["y"], "tile_id": tile.tile_id,
+                "color": body["color"], "owner": body["owner"],
+            }
+            records[(record["x"], record["y"])] = record
+            return {"status": "committed", "shard_id": shard_id, **record}
+        if method == "GET":
+            return {"pixels": list(records.values())}
+        if method == "DELETE":
+            owner = params["user_id"]
+            removed = [record for record in records.values() if record["owner"] == owner]
+            for record in removed:
+                records.pop((record["x"], record["y"]))
+            return {"removed": [{"x": r["x"], "y": r["y"]} for r in removed]}
+        raise AssertionError(f"Unexpected shard method: {method}")
+
+    monkeypatch.setattr(main, "request_shard", fake_request_shard)
     yield
 
 
@@ -36,6 +64,34 @@ def test_different_sessions_draw_and_clear_only_their_current_pixels():
     # The new owner may clear the overwritten pixel.
     assert bob.delete("/clear").json() == {"status": "ok", "cleared": 1}
     assert alice.get("/state").json()["pixels"] == {}
+
+
+def test_coordinator_routes_each_draw_to_the_deterministic_tile_owner():
+    client = TestClient(main.app)
+    client.get("/")
+
+    origin_tile = client.post("/draw", json={"x": 0, "y": 0, "color": "#ff0000"}).json()
+    next_tile = client.post("/draw", json={"x": 25, "y": 0, "color": "#00ff00"}).json()
+
+    assert (origin_tile["tile_id"], origin_tile["shard_id"]) == ("tile-00-00", "shard-1")
+    assert (next_tile["tile_id"], next_tile["shard_id"]) == ("tile-00-01", "shard-2")
+
+
+def test_unavailable_owner_shard_is_not_replaced_by_another_shard(monkeypatch):
+    client = TestClient(main.app)
+    client.get("/")
+    selected_shards = []
+
+    async def unavailable_owner(shard_id, method, path, *, params=None, body=None):
+        selected_shards.append(shard_id)
+        raise main.ShardRequestError(shard_id, "owner shard is unavailable")
+
+    monkeypatch.setattr(main, "request_shard", unavailable_owner)
+    response = client.post("/draw", json={"x": 25, "y": 0, "color": "#00ff00"})
+
+    assert response.status_code == 503
+    assert selected_shards == ["shard-2"]
+    assert main.pixels == {}
 
 
 def test_clear_removes_unoverwritten_pixels_and_repeated_clear_is_a_noop():

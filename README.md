@@ -1,10 +1,10 @@
 # Collaborative Pixel Canvas
 
-A FastAPI collaborative canvas with a Phase 2 Docker execution environment. The browser still talks only to the coordinator. Three independent shard containers expose health and infrastructure-record APIs, each backed by a separate SQLite database and Docker volume.
+A FastAPI collaborative canvas with a Docker Compose coordinator and three shard services. The browser talks only to the coordinator. Stage 3A routes each draw to the deterministic tile owner's shard, where the current pixel colour and session owner are stored in that shard's SQLite database.
 
-For the student-oriented, file-by-file walkthrough, exact function explanations, and reproducible demonstrations, see [FOLLOW_ALONG.md](FOLLOW_ALONG.md).
+For the current system diagram and consistency boundaries, see [ARCHITECTURE.md](ARCHITECTURE.md). For the student-oriented file/function walkthrough and reproducible demonstrations, see [FOLLOW_ALONG.md](FOLLOW_ALONG.md).
 
-**Phase 2 does not implement canvas tile routing, ownership epochs, migration, or recovery protocols.** The canvas and user sessions remain in coordinator memory. Shard records are only for verifying container identity, database isolation, and persistent volumes.
+Tile routing and shard pixel storage are implemented in Stage 3A. Session mappings and active WebSockets remain coordinator-local. Ownership epochs, operation IDs/deduplication, cross-shard atomic Clear, live migration, and crash recovery are not implemented. The opt-in Docker integration test exercises two real browser sessions, shard routing/storage, state refresh, shard-side rejection, and WebSocket snapshots/updates; run it against a live Compose project to verify the current Docker environment.
 
 ## Requirements
 
@@ -76,7 +76,7 @@ Dynamic container creation is not implemented. To add a fourth fixed service:
 3. Append `shard-4=http://shard-4:8004` to `SHARD_URLS` in `.env`.
 4. Start it with `docker compose up -d --build shard-4 coordinator`.
 
-The coordinator reads `SHARD_URLS` at request time, so the new service appears in `/admin/shards` after it is healthy. Use a unique service name, shard ID, port, and volume for every shard.
+The coordinator reads `SHARD_URLS` at request time, so the new service can appear in `/admin/shards` after it is healthy. Keep `SHARD_IDS` unchanged if you only want to check the new service's health. **Do not add shard-4 to `SHARD_IDS` while existing pixel data matters:** Stage 3A's modulo mapping would reassign many tiles, and migration is not implemented. A safe active routing change must wait for a later migration phase.
 
 ## Tests
 
@@ -95,7 +95,7 @@ python -m pytest -q tests/integration -p no:cacheprovider
 Remove-Item Env:RUN_DOCKER_INTEGRATION
 ```
 
-That integration test checks actual Docker DNS health results, distinct mounted volume names, record isolation, and record persistence across `docker compose restart shard-1`.
+The integration test checks actual Docker DNS health results and distinct mounted volume names. It creates two independent browser sessions, connects both to WebSockets, checks their shard-backed initial snapshots, routes a draw at `(25, 0)` to `tile-00-01` on shard-2, verifies the shard record and coordinator state, checks shard-1 rejects that tile, and confirms both sessions receive each other's draw updates. It restores any existing pixel records at its test coordinates and clears its session-owned writes. It also checks infrastructure-record isolation and persistence across `docker compose restart shard-1`.
 
 ## Local development without Docker
 

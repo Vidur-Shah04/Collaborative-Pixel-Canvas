@@ -1,8 +1,4 @@
-"""Single-process collaborative canvas prototype.
-
-The in-memory stores here are intentionally temporary. The coordinator/shard
-and durable storage work is planned for later phases.
-"""
+"""Browser-facing coordinator for the collaborative pixel canvas."""
 
 from pathlib import Path
 import asyncio
@@ -12,9 +8,10 @@ import secrets
 import uuid
 
 import httpx
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
+from shared.tiles import configured_shard_ids, shard_for_tile, tile_for_pixel
 
 logger = logging.getLogger(__name__)
 
@@ -42,9 +39,9 @@ app = FastAPI(title="Collaborative Pixel Canvas")
 canvas_lock = asyncio.Lock()
 
 # Session tokens are issued by the server and never accepted from request bodies.
-# This in-memory registry, like the canvas, is reset when the process restarts.
+# Session identity is process-local; shard SQLite files hold the pixel records.
 sessions: dict[str, str] = {}
-# Coordinate -> {color, owner}. Last committed draw wins in this prototype.
+# Coordinate -> {color, owner} cache, refreshed from the shard stores on reads.
 pixels: dict[str, dict[str, str]] = {}
 SESSION_COOKIE = "canvas_session"
 DEFAULT_SHARD_URLS = (
@@ -53,6 +50,17 @@ DEFAULT_SHARD_URLS = (
     "shard-3=http://shard-3:8003"
 )
 SHARD_HEALTH_TIMEOUT = httpx.Timeout(connect=1.0, read=2.0, write=1.0, pool=1.0)
+SHARD_OPERATION_TIMEOUT = httpx.Timeout(connect=1.0, read=5.0, write=5.0, pool=1.0)
+
+
+class ShardRequestError(Exception):
+    """An owner shard could not complete a routed coordinator request."""
+
+    def __init__(self, shard_id: str, detail: str, status_code: int = 503):
+        super().__init__(detail)
+        self.shard_id = shard_id
+        self.detail = detail
+        self.status_code = status_code
 
 
 class DrawRequest(BaseModel):
@@ -85,6 +93,61 @@ def configured_shards() -> list[tuple[str, str]]:
             raise ValueError("SHARD_URLS entries must use shard-id=http(s)://host:port")
         targets.append((shard_id.strip(), url.strip().rstrip("/")))
     return targets
+
+
+def shard_urls_by_id() -> dict[str, str]:
+    urls = dict(configured_shards())
+    shard_ids = set(configured_shard_ids())
+    if not shard_ids.issubset(urls):
+        raise ValueError("SHARD_URLS must include every shard in SHARD_IDS")
+    return urls
+
+
+async def request_shard(
+    shard_id: str,
+    method: str,
+    path: str,
+    *,
+    params: dict | None = None,
+    body: dict | None = None,
+) -> dict:
+    """Send one internal API request to the explicitly selected shard."""
+    try:
+        url = shard_urls_by_id()[shard_id]
+    except (KeyError, ValueError) as exc:
+        raise ShardRequestError(shard_id, "shard routing configuration is incomplete") from exc
+    try:
+        async with httpx.AsyncClient(timeout=SHARD_OPERATION_TIMEOUT) as client:
+            response = await client.request(
+                method, f"{url}{path}", params=params, json=body
+            )
+            response.raise_for_status()
+        result = response.json()
+        if not isinstance(result, dict):
+            raise ValueError("shard response must be a JSON object")
+        return result
+    except httpx.HTTPStatusError as exc:
+        logger.warning("Shard %s rejected %s %s: %s", shard_id, method, path, exc)
+        raise ShardRequestError(shard_id, "owner shard rejected the request", 502) from exc
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning("Shard request failed for %s: %s %s: %s", shard_id, method, path, exc)
+        raise ShardRequestError(shard_id, "owner shard is unavailable", 503) from exc
+
+
+async def load_pixels_from_shards() -> dict[str, dict[str, str]]:
+    """Read and combine current pixel records from every configured shard."""
+    shard_ids = configured_shard_ids()
+    results = await asyncio.gather(
+        *(request_shard(shard_id, "GET", "/pixels") for shard_id in shard_ids)
+    )
+    state: dict[str, dict[str, str]] = {}
+    for result in results:
+        for pixel in result.get("pixels", []):
+            state[f"{pixel['x']},{pixel['y']}"] = {
+                "color": pixel["color"],
+                "owner": pixel["owner"],
+            }
+    return state
 
 
 async def inspect_shard(shard_id: str, url: str) -> dict:
@@ -135,8 +198,13 @@ def home(request: Request):
 @app.get("/state")
 async def get_state(request: Request):
     token, _ = session_for(request.cookies.get(SESSION_COOKIE))
-    async with canvas_lock:
-        state = public_pixels()
+    try:
+        async with canvas_lock:
+            pixels.clear()
+            pixels.update(await load_pixels_from_shards())
+            state = public_pixels()
+    except (ShardRequestError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail="canvas storage is unavailable") from exc
     response = JSONResponse({"pixels": state})
     response.set_cookie(SESSION_COOKIE, token, httponly=True, samesite="lax")
     return response
@@ -145,12 +213,43 @@ async def get_state(request: Request):
 @app.post("/draw")
 async def draw(request: DrawRequest, http_request: Request):
     token, user_id = session_for(http_request.cookies.get(SESSION_COOKIE))
-    key = f"{request.x},{request.y}"
+    tile = tile_for_pixel(request.x, request.y)
+    shard_id = shard_for_tile(tile)
     color = request.color.upper()
-    async with canvas_lock:
-        pixels[key] = {"color": color, "owner": user_id}
-        await manager.broadcast({"type": "draw", "x": request.x, "y": request.y, "color": color})
-    response = JSONResponse({"status": "ok", "x": request.x, "y": request.y, "color": color})
+    key = f"{request.x},{request.y}"
+    try:
+        async with canvas_lock:
+            committed = await request_shard(
+                shard_id,
+                "POST",
+                "/pixels",
+                body={
+                    "x": request.x,
+                    "y": request.y,
+                    "tile_id": tile.tile_id,
+                    "color": color,
+                    "owner": user_id,
+                },
+            )
+            if any(
+                committed.get(field) != expected
+                for field, expected in {
+                    "status": "committed",
+                    "shard_id": shard_id,
+                    "tile_id": tile.tile_id,
+                    "color": color,
+                    "owner": user_id,
+                }.items()
+            ):
+                raise ShardRequestError(shard_id, "owner shard returned an invalid commit receipt", 502)
+            pixels[key] = {"color": committed["color"], "owner": committed["owner"]}
+            await manager.broadcast({"type": "draw", "x": request.x, "y": request.y, "color": color})
+    except ShardRequestError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    response = JSONResponse({
+        "status": "ok", "x": request.x, "y": request.y, "color": color,
+        "tile_id": tile.tile_id, "shard_id": shard_id,
+    })
     response.set_cookie(SESSION_COOKIE, token, httponly=True, samesite="lax")
     return response
 
@@ -158,14 +257,34 @@ async def draw(request: DrawRequest, http_request: Request):
 @app.delete("/clear")
 async def clear_my_pixels(request: Request):
     token, user_id = session_for(request.cookies.get(SESSION_COOKIE))
-    async with canvas_lock:
-        removed = [key for key, pixel in pixels.items() if pixel["owner"] == user_id]
-        for key in removed:
-            del pixels[key]
-
-        coordinates = [[int(part) for part in key.split(",")] for key in removed]
-        await manager.broadcast({"type": "clear", "pixels": coordinates})
-    response = JSONResponse({"status": "ok", "cleared": len(removed)})
+    shard_ids = configured_shard_ids()
+    try:
+        async with canvas_lock:
+            results = await asyncio.gather(
+                *(
+                    request_shard(
+                        shard_id, "DELETE", "/pixels", params={"user_id": user_id}
+                    )
+                    for shard_id in shard_ids
+                ),
+                return_exceptions=True,
+            )
+            failure = next((result for result in results if isinstance(result, Exception)), None)
+            if failure is not None:
+                if isinstance(failure, ShardRequestError):
+                    raise failure
+                raise ShardRequestError("unknown", "could not clear every shard") from failure
+            coordinates = [
+                [pixel["x"], pixel["y"]]
+                for result in results
+                for pixel in result["removed"]
+            ]
+            for x, y in coordinates:
+                pixels.pop(f"{x},{y}", None)
+            await manager.broadcast({"type": "clear", "pixels": coordinates})
+    except ShardRequestError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    response = JSONResponse({"status": "ok", "cleared": len(coordinates)})
     response.set_cookie(SESSION_COOKIE, token, httponly=True, samesite="lax")
     return response
 
@@ -183,6 +302,12 @@ async def websocket_endpoint(websocket: WebSocket):
         # A mutation is therefore either included in this snapshot or delivered
         # after it as a WebSocket event, never lost between the two.
         async with canvas_lock:
+            try:
+                pixels.clear()
+                pixels.update(await load_pixels_from_shards())
+            except (ShardRequestError, ValueError):
+                await websocket.close(code=1011, reason="Canvas storage is unavailable")
+                return
             manager.active_connections.append(websocket)
             await websocket.send_json({"type": "state", "pixels": public_pixels()})
         while True:

@@ -1,7 +1,7 @@
 # Architecture Decision Records
 
 **Project:** Collaborative Pixel Canvas
-**Log status:** Phase 2 source/configuration exists; Docker runtime proof is pending.
+**Log status:** Stage 3A source and local tests implemented; Docker runtime proof is pending.
 **Last reviewed:** 2026-11-03
 
 Records with unknown dates are kept in the order they appeared in the former decision log. They precede the decisions recorded as implemented on 2026-11-02. The original notes did not preserve alternatives, so alternatives below are retrospective comparisons, not quotations from the original deliberation. Status is one of **accepted**, **proposed**, **superseded**, or **deprecated**.
@@ -185,6 +185,28 @@ Records with unknown dates are kept in the order they appeared in the former dec
 - **Rationale:** A narrow infrastructure API verifies process and storage boundaries without implying tile ownership exists.
 - **Consequences/trade-offs:** Shards currently do not receive canvas operations. Tile routing, epochs, migration, recovery, and undo remain future work.
 - **References:** `shard/main.py`, `frontend/main.py`, `ARCHITECTURE.md`, `FOLLOW_ALONG.md`.
+
+### ADR-017 — Stable row-major tile identity and modulo routing
+
+- **Date:** 2026-11-03
+- **Status:** accepted
+- **Context:** Stage 3A needs a pure, repeatable tile calculation and one deterministic owner among the configured shard set, without a network request or Python randomized hashing.
+- **Decision:** Validate strict integer pixels in the 1000×1000 canvas; derive 25×25 tile coordinates; form a row-major ordinal `tile_y * 40 + tile_x`; name tiles `tile-{row:02d}-{column:02d}`; assign the ordinal modulo the canonical lexically sorted `SHARD_IDS` tuple.
+- **Alternatives considered:** Python `hash()` (randomized per process), a coordinator network lookup for every coordinate, or an ownership registry. The first is not stable; the second adds latency; the registry/epochs are Stage 3B work.
+- **Rationale:** Arithmetic is easy to test and shared identically by coordinator and shards. The 1,600 tiles divide as 533/533/534 over three IDs.
+- **Consequences/trade-offs:** The mapping is deterministic only for a fixed shard set. Adding/removing a shard remaps many tiles, so do not change active `SHARD_IDS` while data matters. No migration or explicit ownership table exists yet.
+- **References:** `shared/tiles.py`, `tests/test_tiles.py`, `frontend/main.py`, `shard/main.py`.
+
+### ADR-018 — Persist routed pixels at the selected shard before broadcast
+
+- **Date:** 2026-11-03
+- **Status:** accepted
+- **Context:** Stage 3A must make the tile owner authoritative for a pixel write while preserving server-managed user ownership and WebSocket behavior.
+- **Decision:** The coordinator derives the owner, sends coordinates/tile/color/server session owner to exactly that shard, and only updates its cache/broadcasts after validating a successful commit receipt. A shard independently recomputes the tile, rejects mismatched tile IDs or tiles assigned elsewhere, and transactionally upserts one SQLite pixel row containing both color and owner. State reads collect records from all active shards.
+- **Alternatives considered:** Keep the coordinator as the pixel source of truth and mirror writes to shards, broadcast before shard acknowledgment, or let any shard accept any coordinate. These can lose data on coordinator failure, show uncommitted changes, or create duplicate/conflicting pixel copies.
+- **Rationale:** The selected shard becomes the authoritative storage location for the tile's current pixels, and the client sees a commit only after that shard confirms it.
+- **Consequences/trade-offs:** There are no operation IDs, epochs, durable sequence positions, or retry deduplication. The coordinator lock orders one process only. Clear fans out local owner deletions to all shards; without a distributed transaction, a mid-clear failure can leave partial deletions, so no success or broadcast is returned in that case. The opt-in Compose integration test now checks two browser sessions, owner-shard persistence, coordinator state refresh, non-owner rejection, and WebSocket snapshots/draw broadcasts. A passing test run still depends on access to the Docker daemon and live Compose services.
+- **References:** `frontend/main.py` `request_shard`, `load_pixels_from_shards`, `draw`, `clear_my_pixels`; `shard/main.py` `write_pixel`, `list_pixels`, `clear_owned_pixels`; `tests/test_canvas.py`, `tests/test_infrastructure.py`, `tests/integration/test_docker_services.py`.
 
 ## Maintaining this log
 

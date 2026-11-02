@@ -11,9 +11,11 @@ The project currently demonstrates several useful distributed-systems building b
 - **Identity and ownership:** the coordinator issues an opaque browser cookie and maps it to a server-side session ID. Every occupied coordinate stores its current colour and the session that last drew it.
 - **Concurrent updates:** one `asyncio.Lock` serializes canvas reads, draws, clears, WebSocket registration, initial snapshots, and broadcasts inside the coordinator process.
 - **Service separation:** Docker Compose describes a coordinator and three independently configured shard services, connected by a bridge network and DNS names.
-- **Storage isolation:** each shard service has a distinct SQLite file in its own named Docker volume. Its sample record endpoints are infrastructure probes only.
+- **Deterministic tile routing:** a shared routing module maps each pixel to a row-major tile and assigns each tile to one configured shard without Python's randomized `hash()`.
+- **Shard-owned pixel records:** the coordinator sends each draw to its selected shard. That shard verifies tile ownership and writes the pixel's colour and session owner into SQLite.
+- **Storage isolation:** each shard service has a distinct SQLite file in its own named Docker volume. The same DB also contains sample infrastructure records.
 
-The browser talks to the coordinator only. The coordinator serves the page, accepts drawing and clear HTTP requests, and sends live updates to browser WebSockets. At Phase 2, it contacts shard services only for `/health` probes. It does **not** route canvas pixels to shards. The coordinator still stores canvas pixels and sessions in process memory.
+The browser talks to the coordinator only. It accepts drawing/Clear HTTP requests, routes pixels to shards, and sends WebSocket updates only after the assigned shard confirms a write. It also reads pixel state from all assigned shards. Session mappings and a coordinator pixel cache remain in memory. Docker source/configuration exists, but live container verification must be established on a machine with Docker.
 
 Docker containers simulate distinct processes and service identities on one physical computer. A Compose network gives each service a DNS name, and named volumes keep each shard database across container restarts. This is a useful local distributed-systems lab, but it is not a simulation of separate physical computers or networks with independent failures.
 
@@ -77,7 +79,7 @@ The coordinator is published on host port 8000:
 - Coordinator health: <http://localhost:8000/health>
 - Live shard health overview: <http://localhost:8000/admin/shards>
 
-The `.env` file sets `SHARD_URLS`. The coordinator uses entries such as `shard-1=http://shard-1:8001`; Docker DNS resolves those service names inside `canvas-net`. Shard ports are not published to Windows.
+The `.env` file sets `SHARD_URLS` and `SHARD_IDS`. The coordinator uses entries such as `shard-1=http://shard-1:8001`; Docker DNS resolves those service names inside `canvas-net`. `SHARD_IDS` defines the active route set. Shard ports are not published to Windows.
 
 Useful lifecycle and inspection commands:
 
@@ -117,9 +119,9 @@ The integration test calls the host coordinator, runs HTTP requests inside actua
 flowchart LR
     Browser[Browser page and canvas] -->|GET page, POST draw, DELETE clear| Coordinator[Coordinator FastAPI :8000]
     Browser <-->|WebSocket /ws state and updates| Coordinator
-    Coordinator -->|HTTP GET /health via Docker DNS| S1[shard-1 :8001]
-    Coordinator -->|HTTP GET /health via Docker DNS| S2[shard-2 :8002]
-    Coordinator -->|HTTP GET /health via Docker DNS| S3[shard-3 :8003]
+    Coordinator -->|health and routed pixel HTTP| S1[shard-1 :8001]
+    Coordinator -->|health and routed pixel HTTP| S2[shard-2 :8002]
+    Coordinator -->|health and routed pixel HTTP| S3[shard-3 :8003]
     S1 --> DB1[(shard1_data: SQLite)]
     S2 --> DB2[(shard2_data: SQLite)]
     S3 --> DB3[(shard3_data: SQLite)]
@@ -133,19 +135,27 @@ flowchart LR
 4. A pointer click posts `x`, `y`, and a HEX colour to `/draw`. The server gets the owner from the cookie, not from request JSON.
 5. `DELETE /clear` removes only records currently owned by that session.
 
+### Tile calculation and shard assignment
+
+`shared/tiles.py` is copied into both images and imported by both coordinator and shards. It accepts only real integer coordinates (not booleans or fractional numbers) within the 1000×1000 grid. For pixel `(x,y)`, `tile_x=x//25`, `tile_y=y//25`, and `tile_index=tile_y*40+tile_x`. The ID format is `tile-{row:02d}-{column:02d}`: `(25,0)` is `tile-00-01`, and `(999,999)` is `tile-39-39`.
+
+`SHARD_IDS` is sorted lexically, then `tile_index % number_of_shards` selects one owner. With three default shards, tile index 0 routes to shard-1, index 1 to shard-2, index 2 to shard-3, and index 3 returns to shard-1. All 1,600 tiles are assigned once; counts are 533, 533, and 534. Reordering `SHARD_IDS` has no effect. Changing the set does: modulo can remap many tiles, and there is no migration yet, so do not change active IDs while data matters.
+
 ### Pixel ownership and synchronization
 
-`pixels` is a dictionary keyed by strings like `"12,12"`. Each value is one object containing both `color` and `owner`. A successful draw replaces that object in one assignment, so a new colour is never paired with the old owner. The last draw that acquires `canvas_lock` wins that coordinate.
+The coordinator obtains a session owner from the HTTP-only cookie, never a browser-supplied `user_id`. A draw includes `x`, `y`, calculated `tile_id`, normalized colour, and that session owner in an internal request. The target shard recalculates the tile, verifies the ID and verifies that the routing algorithm selects itself. A wrong tile ID gets 422; a tile assigned elsewhere gets 409.
 
-Draw and clear hold `canvas_lock` while changing the dictionary and broadcasting the resulting event. WebSocket registration and its snapshot use the same lock. Thus, within this single coordinator process, a new connection sees either a mutation in its initial snapshot or that mutation as a subsequent event. A concurrent clear and draw are serialized into one of two valid orders; the lock prevents a torn colour/owner update. This is not a distributed ordering guarantee across coordinator processes.
+Each shard stores one row keyed by `(x,y)` with both colour and owner in one SQLite upsert. This preserves the most recent writer as current owner. The coordinator waits for the owning shard's committed response, checks its shard ID/tile/colour/owner receipt, then updates its in-memory cache and broadcasts. A failure or invalid receipt produces an error and is not broadcast.
 
-When Alice draws `(12,12)` red and Bob overwrites it green, the record becomes `{color: "#00FF00", owner: Bob's session}`. Alice's clear filters the current owner and leaves it. Bob's clear removes it.
+`GET /state` and new WebSocket snapshots combine records from all active shards; state reads fail instead of returning a silently incomplete canvas when a shard is unavailable. `DELETE /clear` asks every routing shard to delete rows for the caller's server-managed session ID, then broadcasts the removed coordinates when all calls succeed. Each shard's delete is locally transactional, but there is no distributed transaction across shards: a failure mid-clear can leave partial deletion and returns an error without a broadcast. A later state read reloads the stored result.
+
+One `asyncio.Lock` covers coordinator state reads, shard operations, cache updates, WebSocket registration/snapshots, and broadcasts. In a single coordinator process it orders a draw and a clear and prevents a snapshot from racing with a write. It is not a guarantee across multiple coordinator processes.
 
 ### Coordinator to shards and SQLite
 
 Compose places all four services on `canvas-net`. The coordinator checks configured URLs such as `http://shard-1:8001/health`; each shard checks its own SQLite connection and returns its configured ID and service version. `/admin/shards` makes the probes concurrently with short timeouts and returns per-shard health, including unavailable nodes.
 
-Each shard writes only its own `infrastructure_records` table in `/data/shard.sqlite3`. `shard1_data`, `shard2_data`, and `shard3_data` are separate Docker-managed named volumes mounted at `/data`. These records demonstrate container storage boundaries and restart persistence. They are not canvas pixels, operation history, snapshots, or migration state.
+Each shard has `infrastructure_records` and `pixels` tables in its own `/data/shard.sqlite3`. `POST /pixels` validates the deterministic owner before upserting; `GET /pixels` returns that shard's pixel records; `DELETE /pixels?user_id=...` clears only that user on that shard. `shard1_data`, `shard2_data`, and `shard3_data` are separate Docker-managed named volumes mounted at `/data`. Pixel records are durable when those volumes work, but no operation history, epochs, snapshots, or migration state is present.
 
 ## D. File-by-file guide
 
@@ -153,18 +163,21 @@ Each shard writes only its own `infrastructure_records` table in `/data/shard.sq
 |---|---|
 | `frontend/main.py` | Coordinator app, HTTP routes, cookie sessions, current pixel ownership, WebSocket manager, and live shard health probes. Serves `index.html`; imports HTTPX for shard probes. |
 | `frontend/index.html` | Browser UI, Canvas drawing, HTTP draw/clear requests, WebSocket state/update rendering. |
-| `shard/main.py` | Factory for the common shard FastAPI app, per-service identity/configuration, SQLite setup, health/info, and infrastructure record API. Compose starts this same module three times. |
+| `shared/tiles.py` | Shared strict coordinate validation, stable row-major tile IDs, canonical shard ID configuration, and deterministic owner selection. Both coordinator and shard import it. |
+| `shared/__init__.py` | Marks `shared` as an importable package so both images can load the same routing code. |
+| `shard/main.py` | Factory for the common shard FastAPI app, SQLite setup, infrastructure record APIs, deterministic per-pixel owner validation, and pixel read/write/clear APIs. Compose starts this same module three times. |
 | `shard/__init__.py` | Marks `shard` as an importable Python package for Uvicorn and tests. |
 | `docker/coordinator.Dockerfile` | Builds the coordinator image with Python dependencies and `frontend/`; starts Uvicorn on port 8000. |
 | `docker/shard.Dockerfile` | Builds the common shard image and starts Uvicorn on the environment-provided internal port. |
 | `docker-compose.yml` | Defines coordinator, three shard services, health checks, restart policies, private bridge network, published coordinator port, and separate named volumes. |
-| `.env.example` | Template for `SHARD_URLS`; copy to `.env`. |
+| `.env.example` | Template for `SHARD_URLS` (service addresses) and `SHARD_IDS` (active tile-routing set); copy to `.env`. |
 | `.dockerignore` | Keeps local virtual environments, tests, caches, databases, and secrets out of image build contexts. |
 | `.gitignore` | Excludes local environments, database files, cache output, and `.env` from normal version control. |
-| `requirements.txt` | Runtime and test dependencies; versions are currently unpinned. |
+| `requirements.txt` | Runtime and test dependencies, including the synchronous WebSocket client used by the real-container integration test. |
 | `pytest.ini` | Registers the `integration` pytest marker. |
 | `tests/test_canvas.py` | Session, ownership/Clear, validation, WebSocket ordering, and lock interleaving regressions. |
 | `tests/test_infrastructure.py` | Local shard API and mocked coordinator health/discovery tests. It does not start containers. |
+| `tests/test_tiles.py` | Pure tests for coordinate boundaries, stable tile IDs, deterministic assignment, and shard balance. |
 | `tests/integration/test_docker_services.py` | Opt-in test that uses a live Compose project and real shard containers. |
 | `README.md` | Short setup, command, and troubleshooting entry point linking here. |
 | `ARCHITECTURE.md` | Concise system boundary, network, health, storage, and Phase 3 scope description. |
@@ -185,9 +198,15 @@ Each shard writes only its own `infrastructure_records` table in `/data/shard.sq
 
 **`session_for(token)`** accepts a cookie token or `None`; it returns `(token, user_id)`. A registered token reuses its existing ID. Any missing/unknown token causes a random URL-safe token and UUID session ID to be generated and saved in the server dictionary. It never trusts an ID in a request body. The registry is in memory, has no expiration/authentication, and resets on coordinator restart.
 
-**`public_pixels()`** takes no arguments and returns a new coordinate-to-colour dictionary, omitting owner metadata. `GET /state` and the WebSocket initial snapshot use it while holding `canvas_lock`; this keeps ownership private to server code.
+**`public_pixels()`** takes no arguments and returns a new coordinate-to-colour dictionary from the coordinator cache, omitting owner metadata. `GET /state` and the WebSocket snapshot call it after reloading the cache from shards while holding `canvas_lock`.
 
-**`configured_shards()`** takes no arguments and returns `list[tuple[shard_id, base_url]]`, parsed from comma-separated `SHARD_URLS` entries. If the variable is unset or blank, it uses the three Compose service-name defaults. Malformed entries raise `ValueError`; this is operator configuration, not user input. The coordinator health route calls it for each request, which is why a newly configured fixed shard can be discovered without a code change.
+**`configured_shards()`** takes no arguments and returns `list[tuple[shard_id, base_url]]`, parsed from `SHARD_URLS`. If it is unset or blank, it uses the three Compose service-name defaults. Malformed entries raise `ValueError`. Both health discovery and internal URL lookup use it.
+
+**`shard_urls_by_id()`** takes no arguments and returns a dictionary from shard ID to base URL. It checks that every active `SHARD_IDS` routing owner has a URL, while allowing extra health-only services. A mismatch raises `ValueError` before a draw can be sent to an ambiguous destination.
+
+**`request_shard(shard_id, method, path, *, params=None, body=None)`** sends one bounded HTTPX request to the explicitly named shard URL. It returns a JSON object. HTTP rejections become `ShardRequestError` with 502; network, timeout, or invalid JSON failures become 503. Draw, Clear, and state loading call it. It never retries or selects a different shard.
+
+**`load_pixels_from_shards()`** takes no arguments and concurrently requests `/pixels` from each active shard. It returns a coordinate-keyed dictionary containing internal color and owner fields. It is used by `/state` and WebSocket setup. Any request failure prevents an incomplete combined state from being returned.
 
 **`inspect_shard(shard_id, url)`** asynchronously performs one HTTP GET to `{url}/health` with the configured connect/read/write/pool timeouts. It returns a health dictionary. Matching ID and `healthy` status produce a healthy result with DB/version fields; network/HTTP/JSON failures return `unavailable`, and a valid but mismatched identity/status returns `unhealthy`. It logs HTTP-level failures and does not raise ordinary shard outage errors to the caller.
 
@@ -197,13 +216,13 @@ Each shard writes only its own `infrastructure_records` table in `/data/shard.sq
 
 **`home(request)` — `GET /`** reads the request cookie, calls `session_for`, serves the adjacent `index.html`, and sets `canvas_session` with `httponly=True` and `samesite="lax"`. It returns a `FileResponse`; it creates a session only when needed. The cookie is not Secure in this local HTTP setup.
 
-**`get_state(request)` — `GET /state`** resolves/creates the browser session, acquires `canvas_lock`, copies public pixels, and returns JSON plus the session cookie. It does not mutate pixels. The current browser startup relies on the WebSocket snapshot rather than issuing a competing state fetch.
+**`get_state(request)` route `GET /state` resolves/creates the browser session, acquires `canvas_lock`, reloads records from every active shard into the coordinator cache, then returns coordinate/color data plus the cookie. It returns HTTP 503 if shard state cannot be read completely. The browser gets its initial render from WebSocket instead.
 
-**`draw(request, http_request)` — `POST /draw`** validates `x`, `y`, and `color` through `DrawRequest`. Coordinates must be strict integers from 0 through 999; colour must match six-digit HEX. It gets the user ID from the cookie, uppercases the colour, then under `canvas_lock` atomically replaces `pixels["x,y"]` with `{color, owner}` and broadcasts a `draw` event. It returns a success JSON body and sets the cookie. The lock provides a single-process ordering point; there is no durable commit or shard write.
+**`draw(request, http_request)` route `POST /draw` validates strict integer coordinates and HEX color through `DrawRequest`, gets owner identity from the cookie, calls `tile_for_pixel` and `shard_for_tile`, then under `canvas_lock` sends `POST /pixels` to exactly that shard. It checks the commit receipt status, shard ID, tile ID, color, and owner. Only after the receipt matches does it update the local cache and broadcast. It returns status, coordinates, color, tile ID, shard ID, and cookie; shard failure returns an error without cache update or broadcast. The lock serializes this single coordinator but provides no operation IDs or cross-coordinator ordering.
 
-**`clear_my_pixels(request)` — `DELETE /clear`** obtains the owner from the server-validated session, then under `canvas_lock` selects and deletes only records whose current `owner` matches. It broadcasts their coordinate list, returns the number removed, and sets the cookie. A prior owner cannot delete a later owner's overwrite. Repeating clear is safe and returns zero when that user has nothing left.
+**`clear_my_pixels(request)` route `DELETE /clear` gets owner from the session cookie and under `canvas_lock` sends a delete-by-user request to every active shard. Each shard removes only rows currently owned by that session. The coordinator updates its cache and broadcasts combined coordinates only when every request succeeds, then returns the removed count and cookie. A previous owner cannot remove an overwrite. A repeated clear returns zero when all shards respond. There is no atomic transaction across shards: a failure after one shard deletes can leave partial deletion, return an error, and suppress the event. This is a Stage 3A limitation.
 
-**`websocket_endpoint(websocket)` — `WS /ws`** reads the cookie and rejects unregistered tokens with close code 1008. After accepting, it acquires `canvas_lock`, registers the connection, and sends a state snapshot before releasing the lock. It waits for client messages only to keep the socket open; drawing is HTTP-based. Disconnects and errors run cleanup in `finally`; unexpected errors are logged. This lock coupling prevents the snapshot/update race within one process.
+**`websocket_endpoint(websocket)` route `WS /ws` reads and validates the registered cookie, accepts the socket, then under `canvas_lock` reloads pixels from every active shard and sends a full color-only snapshot before later operations can proceed. If shard reads fail, it closes with code 1011. It waits for client messages only to keep the socket open; draw commands use HTTP. Disconnects and errors are cleaned up in `finally`. This prevents snapshot/update races in the single coordinator process.
 
 **`DrawRequest`** is the Pydantic input model used by `/draw`. Its three fields validate bounds and HEX syntax before the route mutates shared state. It has no custom methods or side effects.
 
@@ -211,13 +230,15 @@ Each shard writes only its own `infrastructure_records` table in `/data/shard.sq
 
 **`RecordRequest`** validates infrastructure write JSON: a nonempty key up to 200 characters and a value up to 4000 characters. FastAPI returns a validation response for invalid values; the model itself does no I/O.
 
-**`create_app(shard_id=None, port=None, database_path=None)`** builds and returns one FastAPI app. Optional arguments support isolated tests; otherwise identity, port, DB path, and version come from environment defaults. It defines the nested DB helpers and route handlers below, then attaches them to this app instance. Each Compose container calls the same module but receives a different identity, port, and volume path.
+**`PixelWriteRequest`** validates internal routed pixel JSON. It requires strict in-bounds integers, a tile ID, six-digit HEX color, and nonempty owner string. It does not choose the owner; the coordinator sets it from its cookie session.
+
+**`create_app(shard_id=None, port=None, database_path=None)`** builds and returns one FastAPI app. Optional arguments support isolated tests; otherwise identity, port, active shard IDs, DB path, and version come from environment/defaults. It defines DB helpers and route handlers, then attaches them to this app. Each Compose container uses the same code with its own identity, port, and volume. It imports the same `shared.tiles` assignment logic as the coordinator.
 
 **Nested `connect()`** takes no arguments and returns a configured `sqlite3.Connection`. It creates the parent directory, opens only this app's database with a five-second timeout, uses row objects, and sets SQLite's busy timeout.
 
 **Nested `database_connection()`** is a context manager with no parameters. It opens one connection, commits/rolls back through the SQLite context, and always closes in `finally`. Shard endpoints use it so requests do not leak file handles.
 
-**Nested `initialize_database()`** creates `infrastructure_records` if absent. It uses a parameterless `CREATE TABLE IF NOT EXISTS`; the primary key is the record key. It runs during application lifespan startup and does not delete existing records.
+**Nested `initialize_database()`** creates `infrastructure_records`, `pixels`, and an owner lookup index if absent. Pixel rows have coordinate primary key and store tile ID, color, and owner together. It runs during application startup and does not delete existing records.
 
 **Nested `lifespan(app)`** initializes the DB before serving and then yields control to FastAPI. It has no response body; a DB initialization failure prevents the service from starting healthy.
 
@@ -231,7 +252,23 @@ Each shard writes only its own `infrastructure_records` table in `/data/shard.sq
 
 **`get_record(record_key)` — shard `GET /records/{record_key}`** parameterizes the lookup. It returns the row or raises HTTP 404 if absent; it never creates data.
 
+**`write_pixel(pixel)` route `POST /pixels`** converts the pixel coordinates to a `TileAddress`, rejects a mismatched tile ID with 422, and calculates the expected owner shard. If this service is not the owner it returns 409 without writing. Otherwise it performs one parameterized SQLite upsert that replaces the entire coordinate row (color and owner together), commits, and returns a commit receipt. It relies on the coordinator to provide the session owner and does not implement operation IDs or epochs.
+
+**`list_pixels()` route `GET /pixels`** reads this shard's rows ordered by y then x and returns them with owner metadata for coordinator aggregation. It does not query another shard.
+
+**`clear_owned_pixels(user_id)` route `DELETE /pixels?user_id=...`** selects the caller's coordinates and deletes rows for that user in one local SQLite transaction, then returns removed coordinates. It only guarantees atomicity on this one database, not across all shards.
+
 The module-level **`app = create_app()`** is the object Uvicorn imports in each shard container. The factory's default local DB path is under `shard/data`; Compose overrides it to `/data/shard.sqlite3` inside each named volume.
+
+### `shared/tiles.py`
+
+**`TileAddress`** is an immutable dataclass containing tile column (`tile_x`), tile row (`tile_y`), row-major ordinal (`tile_index`), and stable ID (`tile_id`). It distinguishes pixel coordinates from tile coordinates.
+
+**`tile_for_pixel(x, y)`** accepts two values and returns a `TileAddress`. It rejects values whose exact Python type is not `int` (including booleans), and coordinates outside the 1000?1000 grid. It divides by 25 and computes `tile_index = tile_y * 40 + tile_x`; the ID is `tile-{row:02d}-{column:02d}`. It is pure and has no I/O.
+
+**`configured_shard_ids(value=None)`** accepts an optional comma-separated string; otherwise it reads `SHARD_IDS` or uses the default three IDs. It rejects empty entries and duplicates, sorts the IDs, and returns a tuple. Sorting means deployment configuration order cannot change routing. It does not read shard health.
+
+**`shard_for_tile(tile, shard_ids=None)`** accepts one `TileAddress` and optionally a shard tuple, then returns exactly one ID at `tile_index % len(sorted IDs)`. It raises `ValueError` for an explicitly empty list. The function uses integer arithmetic rather than Python's randomized hash. It is stable only while the active shard set is unchanged; adding/removing IDs requires migration, which is not implemented.
 
 ### `frontend/index.html`
 
@@ -251,11 +288,17 @@ The constants and event handlers together ensure the browser connects to the sam
 
 ### `tests/test_canvas.py`
 
-Each `test_*()` function below takes no explicit arguments except where a fixture is named, returns no application value (`None`), and establishes behavior through assertions. FastAPI TestClient calls may mutate the module-level app state, which `reset_memory_state()` clears before the next test. The inner `scenario()` coroutines take no arguments and return no value; they exist to coordinate deterministic async events.
+Each `test_*()` function below takes no explicit arguments except where a fixture is named, returns no application value (`None`), and establishes behavior through assertions. FastAPI TestClient calls may mutate module-level coordinator state; `reset_memory_state()` clears it and replaces `request_shard` with a per-test fake shard store. The fake uses the real tile routing function but no network or SQLite. The inner `scenario()` coroutines take no arguments and return no value; they coordinate deterministic async events.
 
-**`reset_memory_state()`** is an autouse pytest fixture. Before each test, it clears coordinator pixels, sessions, connections, and replaces the async lock. It yields to the test and has no teardown logic. This prevents process-global state leaking between cases.
+**`reset_memory_state(monkeypatch)`** is an autouse pytest fixture. Before each test, it clears coordinator pixels, sessions, connections, and replaces the async lock. It creates a per-test dictionary for each configured shard and monkeypatches the network request helper to use that fake. It yields to the test; pytest restores the patch afterward.
+
+Its nested **`fake_request_shard(shard_id, method, path, *, params=None, body=None)`** takes the coordinator's exact internal request arguments. It simulates POST upsert, GET listing, and DELETE by owner, returning JSON-shaped dictionaries. For a POST it checks tile ID and expected owner using the real routing function. Unexpected methods/paths raise `AssertionError`. It returns no HTTP response and performs no network or SQLite I/O.
 
 **`test_different_sessions_draw_and_clear_only_their_current_pixels()`** uses separate TestClients as users A and B. It checks the requested `(12,12)` red-to-green overwrite, A's clear preserving B's green pixel, then B's clear removing it. It returns no value; failures identify ownership regressions.
+
+**`test_coordinator_routes_each_draw_to_the_deterministic_tile_owner()`** posts pixels in tile 0 and tile 1 and checks the response tile IDs and selected shard IDs. The fixture's fake shard store verifies the same expected owner before accepting.
+
+**`test_unavailable_owner_shard_is_not_replaced_by_another_shard(monkeypatch)`** replaces `request_shard` with a failure fake and checks a tile assigned to shard-2 returns 503, attempts only shard-2, and does not modify the cache.
 
 **`test_clear_removes_unoverwritten_pixels_and_repeated_clear_is_a_noop()`** draws two coordinates in one session, confirms one clear removes both, and confirms a second clear returns zero. It covers ordinary ownership deletion and idempotent repeated requests.
 
@@ -283,6 +326,16 @@ Its fake socket's **`send_json(message)`** appends each event and pauses after t
 
 **`test_websocket_receives_state_and_committed_draw_update()`** checks the empty initial state and normalized draw event on a live TestClient WebSocket.
 
+### `tests/test_tiles.py`
+
+**`test_pixel_to_tile_examples(x, y, tile_x, tile_y, tile_index, tile_id)`** is parameterized with the six requested boundary examples. It checks the full conversion tuple; each parameter set returns no value.
+
+**`test_pixel_to_tile_rejects_invalid_or_ambiguous_coordinates(x, y)`** is parameterized over negative, out-of-range, fractional, and boolean coordinates, expecting `ValueError` for each.
+
+**`test_every_tile_maps_deterministically_to_exactly_one_balanced_shard()`** iterates the full 40×40 tile grid. It verifies stable IDs are unique, mapping ignores the order of a shard-ID tuple, every owner is in the configured set, and assignment counts are 533/533/534.
+
+**`test_shard_id_list_rejects_duplicates_and_empty_entries()`** verifies malformed active routing lists raise `ValueError` rather than creating ambiguous assignments.
+
 ### `tests/test_infrastructure.py`
 
 The test functions return no value; they use temporary SQLite files or a TestClient. The two tests with a `monkeypatch` parameter use pytest's fixture to override environment/probe behavior and restore it after the test.
@@ -290,6 +343,10 @@ The test functions return no value; they use temporary SQLite files or a TestCli
 **`test_shard_health_reports_identity_database_and_version()`** builds an app against a temporary test DB, starts its lifespan with TestClient, and checks health and configured port. It removes its test DB afterward.
 
 **`test_shard_records_are_transactional_and_databases_are_isolated()`** starts two factory-created shard apps with distinct DB paths, writes a key to shard one, reads it there, and expects 404 from shard two. It cleans both DB files.
+
+**`test_shard_rejects_pixels_assigned_to_a_different_shard()`** checks that shard-1 rejects a wrong tile ID with 422 and a valid tile assigned to shard-2 with 409, leaving its pixel table empty.
+
+**`test_shard_commits_and_clears_pixels_for_tiles_it_owns()`** writes tile-00-01 through shard-2, overwrites Alice's row with Bob's color/owner, confirms Alice's delete finds nothing, then confirms Bob's delete removes the coordinate. This uses local TestClient and SQLite, not a container.
 
 **`test_coordinator_reports_live_shard_checks_and_unavailable_shards(monkeypatch)`** sets three service URLs and replaces `inspect_shard` with an async fake for this unit test. It verifies one unavailable result does not fail `/admin/shards`. It does **not** demonstrate Docker DNS.
 
@@ -307,15 +364,23 @@ Module setup skips the test unless `RUN_DOCKER_INTEGRATION=1` and the Docker CLI
 
 **`call_container_shard(shard, port, path, method="GET", payload=None)`** builds a small Python urllib script and runs it with `docker compose exec -T` inside the requested shard container. It is used because shard ports are private and not published to the host.
 
+**`browser_json(browser, url, method="GET", payload=None)`** sends an HTTP request through one cookie-preserving browser opener and returns its status and JSON body, including error responses.
+
+**`post_container_shard_status(shard, port, path, payload)`** posts a pixel record from inside a shard container and returns HTTP status plus JSON. It lets the real-container test assert a 409 from a non-owner shard without treating the expected rejection as a subprocess failure.
+
+**`open_browser_session()`** creates a fresh cookie jar, requests the coordinator page to receive a session cookie, and returns both the browser opener and cookie value. The integration test calls it twice to keep the two browser sessions independent.
+
+**`websocket_url()`** converts the configured HTTP coordinator URL to its WebSocket equivalent for live browser connections.
+
 **`volume_name(shard)`** gets the running container ID and uses `docker inspect` to return the Docker volume mounted at `/data`.
 
-**`test_compose_shards_use_isolated_volumes_and_keep_records_after_restart()`** checks the live coordinator health overview, expected unique shard IDs and service URLs, and three different named volume names. It writes a random record into shard one, confirms shard two returns 404 for that key, restarts shard one, waits for all health probes to recover, and verifies shard one's record is still present.
+**`test_compose_shards_use_isolated_volumes_and_keep_records_after_restart()`** checks the live coordinator health overview, expected unique shard IDs/service URLs, and three different named volumes. It creates two independent cookie sessions and connects both to real coordinator WebSockets before drawing; each initial snapshot must match `/state`. Session A draws `(25,0)`, and the test checks `tile-00-01`/shard-2, the complete stored row's coordinate, tile ID, and color, the refreshed coordinator state, and a 409 plus no row when the same valid tile record is sent directly to shard-1. Session B then draws another pixel in the same tile; both sockets must receive each draw event, which verifies each browser observes the other's operation. Owner-scoped cleanup removes the new test sessions' rows, and any pre-existing rows at the two test coordinates are restored. The test also writes a random infrastructure record into shard-1, confirms shard-2 cannot read it, restarts shard-1, waits for health to return, and verifies the record remains. The test uses the `websockets` client supplied by `uvicorn[standard]` and is opt-in with `RUN_DOCKER_INTEGRATION=1`.
 
 ### `docker/`, `docker-compose.yml`, and configuration
 
-`coordinator.Dockerfile` copies `frontend/`, installs `requirements.txt`, and starts `frontend.main:app` on 8000. `shard.Dockerfile` copies the one `shard/` package and starts it on the environment port. The Compose health-check commands use Python's standard-library urllib; no curl package is required. Compose's only host port mapping is `8000:8000` for the coordinator.
+`coordinator.Dockerfile` copies `frontend/` and `shared/`, installs `requirements.txt`, and starts `frontend.main:app` on 8000. `shard.Dockerfile` copies `shard/` and the same `shared/` code, then starts it on the environment port. The Compose health-check commands use Python's standard-library urllib; no curl package is required. Compose's only host port mapping is `8000:8000` for the coordinator.
 
-`.env.example` supplies the three `SHARD_URLS`; `SHARD_ID`, `PORT`, and `SHARD_DB_PATH` differ per shard service. The dedicated `canvas-net` network supplies DNS names. The top-level volume names are distinct. `requirements.txt` serves both images and local tests, so test packages are also installed in the images in this version.
+`.env.example` supplies `SHARD_URLS` and `SHARD_IDS`; the latter must match across coordinator and shards and defines active ownership. `SHARD_ID`, `PORT`, and `SHARD_DB_PATH` differ per shard service. The dedicated `canvas-net` network supplies DNS names. The top-level volume names are distinct. `requirements.txt` serves both images and local tests, so test packages are also installed in the images in this version.
 
 ## F. Reproducible demonstrations
 
@@ -327,6 +392,31 @@ Module setup skips the test unless `RUN_DOCKER_INTEGRATION=1` and the Docker CLI
 4. Click **Clear my pixels** in the second window. The green pixel disappears from both pages.
 
 The red-to-green behavior is automated in `test_different_sessions_draw_and_clear_only_their_current_pixels`.
+
+### Verify tile routing
+
+The pure routing examples can be run without Docker:
+
+```powershell
+python -m pytest -q tests/test_tiles.py -p no:cacheprovider
+```
+
+With Compose running, draw through the browser-facing coordinator using one cookie session:
+
+```powershell
+$webSession = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+Invoke-WebRequest http://localhost:8000/ -WebSession $webSession | Out-Null
+$drawBody = @{ x = 25; y = 0; color = "#abcdef" } | ConvertTo-Json
+Invoke-RestMethod http://localhost:8000/draw -Method Post -ContentType "application/json" -Body $drawBody -WebSession $webSession
+```
+
+Expected response includes `tile_id: tile-00-01` and `shard_id: shard-2`. Confirm from inside the shard (its port is private to Docker):
+
+```powershell
+docker compose exec shard-2 python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8002/pixels').read().decode())"
+```
+
+The row should show `(25,0)`, `tile-00-01`, `#ABCDEF`, and the session owner. This live demonstration requires Docker; the opt-in integration test performs the same route assertion automatically.
 
 ### Shard discovery and health
 
@@ -358,16 +448,16 @@ Use the PowerShell write/restart/read commands in the [README verification secti
 
 | Capability | Current state |
 |---|---|
-| Shared browser canvas and WebSocket draw/clear updates | Implemented in the coordinator process; local API tests cover key flows. |
+| Shared browser canvas and WebSocket draw/clear updates | Implemented through the coordinator; draws broadcast after a shard commit. Local API tests use fake shard stores. |
 | Server-issued HTTP-only session cookie | Implemented; session map is in coordinator memory, not durable authentication. |
-| Current pixel owner and owner-specific clear | Implemented; overwrite ownership and concurrent draw/clear lock behavior are regression-tested. |
+| Current pixel owner and owner-specific clear | Implemented in shard SQLite rows; overwrite ownership and concurrent draw/clear ordering are covered by local tests. Multi-shard Clear is not atomic if a shard fails mid-request. |
 | Coordinator and three independently configured shard containers | Compose/Dockerfiles are written. Actual startup has not been verified in this environment when Docker is unavailable. |
-| Shard health/info and SQLite infrastructure records | Implemented and covered by local app tests. Live Docker behavior is covered by an opt-in test that must be run against containers. |
+| Shard health/info, infrastructure records, and routed pixel API | Implemented in source and covered by local app tests. Live Docker behavior is covered by an opt-in test that must be run against containers. |
 | Separate named volumes and persistence across restart | Configured; persistence is not considered proven until the real-container test passes. |
-| Tile mapping/routing and only-assigned-tile storage | Planned; not implemented. |
-| Ownership epochs, per-tile positions, durable drawing-operation deduplication | Planned; not implemented. |
+| Tile mapping/routing and only-assigned-tile storage | Stage 3A implemented; deterministic modulo routing and shard-side ownership checks are locally tested. Live Docker routing remains unverified. |
+| Mutable ownership records, epochs, stale-epoch rejection, per-tile positions, operation IDs/deduplication | Planned for later stages; not implemented. |
 | Live tile migration, migration recovery, shard crash recovery | Planned; not implemented. |
-| Undo, coordinated multi-shard clear, snapshots, hashes, timelapse | Planned; not implemented. |
+| Undo, atomic multi-shard clear, snapshots, hashes, timelapse | Planned; not implemented. Current clear fan-out can partially complete if a shard fails. |
 | Multiple coordinator replicas or cross-process WebSocket broadcast | Not implemented. The coordinator is a single point of failure. |
 
 ## Documentation maintenance rules for future phases

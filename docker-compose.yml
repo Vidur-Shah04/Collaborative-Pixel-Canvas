@@ -7,6 +7,7 @@ services:
       - "8000:8000"
     environment:
       SHARD_URLS: ${SHARD_URLS:-}
+      SHARD_IDS: "${SHARD_IDS:-shard-1,shard-2,shard-3}"
     depends_on:
       - shard-1
       - shard-2
@@ -31,6 +32,7 @@ services:
       dockerfile: docker/shard.Dockerfile
     environment:
       SHARD_ID: shard-1
+      SHARD_IDS: "${SHARD_IDS:-shard-1,shard-2,shard-3}"
       PORT: "8001"
       SHARD_DB_PATH: /data/shard.sqlite3
     volumes:
@@ -55,6 +57,7 @@ services:
       dockerfile: docker/shard.Dockerfile
     environment:
       SHARD_ID: shard-2
+      SHARD_IDS: "${SHARD_IDS:-shard-1,shard-2,shard-3}"
       PORT: "8002"
       SHARD_DB_PATH: /data/shard.sqlite3
     volumes:
@@ -79,6 +82,7 @@ services:
       dockerfile: docker/shard.Dockerfile
     environment:
       SHARD_ID: shard-3
+      SHARD_IDS: "${SHARD_IDS:-shard-1,shard-2,shard-3}"
       PORT: "8003"
       SHARD_DB_PATH: /data/shard.sqlite3
     volumes:

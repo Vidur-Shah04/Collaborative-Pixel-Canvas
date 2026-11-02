@@ -1,95 +1,191 @@
-# Collaborative Pixel Canvas — Decision Log
+# Architecture Decision Records
 
-**Project:** Distributed Systems course project  
-**Status:** Phase 1 foundation
-**Last updated:** 2026-11-02
+**Project:** Collaborative Pixel Canvas
+**Log status:** Phase 2 source/configuration exists; Docker runtime proof is pending.
+**Last reviewed:** 2026-11-03
 
-This document records decisions made so far. It distinguishes implemented prototype behavior from planned architecture so teammates do not assume unfinished distributed features already exist.
+Records with unknown dates are kept in the order they appeared in the former decision log. They precede the decisions recorded as implemented on 2026-11-02. The original notes did not preserve alternatives, so alternatives below are retrospective comparisons, not quotations from the original deliberation. Status is one of **accepted**, **proposed**, **superseded**, or **deprecated**.
 
-## 1. Current prototype decisions
+## Historic decisions and proposals (date unknown)
 
-### D-001 — Development environment
-- **Decision:** Develop locally on a standard computer first; the university Remote Computing Environment (RCE) is optional.
-- **Reason:** The proposal allows local execution and does not require separate physical machines for the initial development.
-- **Status:** Agreed.
+### ADR-001 — Develop locally before relying on RCE
 
-### D-002 — Backend and frontend technologies
-- **Decision:** Use Python with FastAPI/Uvicorn for the backend, and HTML/CSS/JavaScript with the browser Canvas API for the frontend.
-- **Reason:** These match the project proposal and are sufficient for the current prototype.
-- **Status:** Implemented in prototype.
+- **Date:** Unknown; present in the original decision log.
+- **Status:** accepted
+- **Context:** The course proposal permits a standard development machine and mentions the university Remote Computing Environment (RCE).
+- **Decision:** Use local development as the baseline; RCE remains optional.
+- **Alternatives considered:** Require RCE from the beginning. This would make the setup dependent on remote access.
+- **Rationale:** Local development is accessible and matches the proposal's stated baseline.
+- **Consequences/trade-offs:** Docker later simulates several service processes locally, but not several physical machines.
+- **References:** `README.md`, `docker-compose.yml`.
 
-### D-003 — Initial API approach
-- **Decision:** Use HTTP endpoints for drawing, state retrieval, and clear requests; use WebSockets for live updates to connected browser clients.
-- **Current endpoints:** `GET /`, `GET /state`, `POST /draw`, `DELETE /clear`, and `WS /ws`.
-- **Status:** Implemented in the current prototype; confirm route names against the current code before relying on them.
+### ADR-002 — Python/FastAPI backend and browser Canvas frontend
 
-### D-004 — Live update delivery
-- **Decision:** The backend serializes each canvas mutation and its broadcast with WebSocket registration and initial state delivery using one async lock. A new client receives a snapshot before later updates, and existing clients receive mutations in commit order.
-- **Reason:** A snapshot/update race could otherwise deliver an update before an older snapshot that then erases it from the browser view.
-- **Trade-off:** The lock is held while messages are sent, so a slow client can delay other canvas operations.
-- **Status:** Implemented and covered by ordering and forced-interleaving tests in the single-process prototype; all 9 tests pass with `python -m pytest -q tests -p no:cacheprovider`.
+- **Date:** Unknown; present in the original decision log.
+- **Status:** accepted
+- **Context:** The project needs an HTTP/WebSocket backend and a small browser drawing interface.
+- **Decision:** Use Python, FastAPI/Uvicorn, HTML, CSS, JavaScript, and the HTML Canvas API.
+- **Alternatives considered:** A different web framework or a larger client-side framework. No formal historic comparison was recorded; the selected stack aligns with the course proposal and keeps the UI small.
+- **Rationale:** FastAPI supports the required HTTP and WebSocket routes; Canvas provides direct pixel rendering.
+- **Consequences/trade-offs:** The UI and coordinator are easy to run together, but the coordinator is still a single point of failure.
+- **References:** `frontend/main.py`, `frontend/index.html`, `requirements.txt`.
 
-### D-005 — User identity
-- **Decision:** The server issues a random HTTP-only cookie token and maps it to a server-side session ID. HTTP draw/clear requests and WebSockets use this session; request bodies cannot choose a user ID.
-- **Limitation:** The registry is in memory, so restart invalidates sessions. This identifies a browser session, not a human account.
-- **Status:** Implemented for the single-process prototype.
+### ADR-003 — HTTP actions and WebSocket live updates
 
-### D-006 — Pixel ownership and user-specific clear
-- **Decision:** Track the current owner of each painted coordinate separately from its colour. A clear request should remove only pixels currently owned by the requesting user and broadcast the affected coordinates so all clients update.
-- **Conflict rule:** If user B overwrites a pixel last drawn by user A, B becomes its current owner. Clearing A must not remove that pixel.
-- **Status:** Implemented and covered by automated tests. Ownership metadata remains in process memory rather than durable history.
-- **Scope clarification:** This is a current-owner model, not a complete operation-history model. Undo and durable history require additional records.
+- **Date:** Unknown; present in the original decision log.
+- **Status:** accepted
+- **Context:** Browsers need to send draw/clear actions and see other sessions' updates.
+- **Decision:** Use HTTP for page/state/draw/clear and WebSockets for initial canvas state and subsequent draw/clear events.
+- **Alternatives considered:** Polling with HTTP or sending all commands over the socket. No formal historic comparison was recorded; separate request routes are easy to inspect while the socket provides server push.
+- **Rationale:** This makes the browser-to-coordinator flow simple to demonstrate.
+- **Consequences/trade-offs:** WebSocket fan-out is only within this one coordinator process.
+- **References:** Routes in `frontend/main.py`; callbacks in `frontend/index.html`.
 
-### D-007 — Initial state storage
-- **Decision:** The first prototype stores painted pixels in process memory using coordinate keys such as `"x,y"`.
-- **Reason:** This keeps the first implementation small while validating the request and rendering flow.
-- **Limitation:** Data is lost when the server process restarts. This is not the final persistence design.
-- **Status:** Implemented in prototype.
+### ADR-004 — Keep initial canvas and session state in coordinator memory
 
-## 2. Planned architecture decisions
+- **Date:** Unknown; present in the original decision log.
+- **Status:** accepted
+- **Context:** The first prototype needed to validate drawing and collaboration before persistence work.
+- **Decision:** Store current pixels, sessions, and active sockets in process memory.
+- **Alternatives considered:** Add durable canvas persistence immediately. The original sequence deferred that work until the browser flow was working.
+- **Rationale:** It keeps the prototype understandable and quick to exercise.
+- **Consequences/trade-offs:** A coordinator restart loses canvas pixels and sessions. Phase 2 shard SQLite stores only infrastructure test records and does not alter this behavior.
+- **References:** Globals `pixels`, `sessions`, and `manager` in `frontend/main.py`; persistence proposal in ADR-009.
 
-### D-008 — Canvas dimensions and tile size
-- **Decision:** Logical canvas is 1000 × 1000 pixels; each tile is 25 × 25 pixels.
-- **Derived result:** 40 × 40 = 1,600 tiles.
-- **Status:** Required project design; tile-based sharding is not yet implemented in the basic prototype.
+### ADR-005 — Target canvas and tile dimensions
 
-### D-009 — Shard processes
-- **Decision:** Run shards as independent Python processes, each with its own port and persistent storage directory. Start locally, then consider RCE if useful.
-- **Status:** Planned.
+- **Date:** Unknown; specified in proposal and former decision log.
+- **Status:** proposed
+- **Context:** Future tile ownership needs a fixed coordinate grid.
+- **Decision:** Target a 1000×1000 canvas and 25×25 tiles, giving a 40×40 grid of 1,600 tiles.
+- **Alternatives considered:** Other grid and tile sizes; the source proposal did not record a comparison.
+- **Rationale:** Preserve the course proposal's dimensions and use an even tile division.
+- **Consequences/trade-offs:** The browser currently uses a 1000×1000 canvas, but tile mapping and per-tile storage are not implemented.
+- **References:** `frontend/index.html`; `document.pdf`; `collab pixel doc.pdf`.
 
-### D-010 — Communication
-- **Decision:** Use WebSockets for live browser updates and HTTP/REST for control operations.
-- **Status:** Basic browser WebSocket broadcast implemented; shard-to-shard communication and migration protocol remain planned.
+### ADR-006 — Use separate shard processes
 
-### D-011 — Operation ordering and idempotency
-- **Decision:** Each committed operation should have a unique operation ID, a per-tile update position, and an ownership epoch. Retries/replays should not apply the same operation more than once. Stale owners must reject writes from old epochs.
-- **Status:** Planned; not provided by the initial in-memory prototype.
+- **Date:** Unknown; planned in the former decision log and proposal.
+- **Status:** proposed
+- **Context:** Logical shards inside one process would not demonstrate independent processes or storage.
+- **Decision:** Run the same shard application as separate services with distinct identities, ports, and storage.
+- **Alternatives considered:** Keep all shards as Python objects in one process, or require separate physical computers. The first does not test process isolation; the second adds setup demands.
+- **Rationale:** Separate processes provide a local path to testing service boundaries.
+- **Consequences/trade-offs:** The Compose implementation is now recorded in ADR-013; containers still share one physical host. Actual Docker startup remains unverified here.
+- **References:** `shard/main.py`, `docker-compose.yml`, `docker/shard.Dockerfile`.
 
-### D-012 — Persistence and recovery
-- **Decision:** Use SQLite and durable operation logs, snapshots, and ordered replay to recover shard state after restart.
-- **Status:** Planned.
+### ADR-007 — Plan operation IDs, per-tile positions, and ownership epochs
 
-### D-013 — Live migration and rebalancing
-- **Decision:** Transfer tile state and relevant log position to a destination while accounting for writes that occur during transfer. Persist migration progress and make interrupted transfers recoverable. Change ownership only after the destination is ready; reject old-epoch writes at the source.
-- **Status:** Planned. The protocol and its failure cases must be designed and tested before claiming safe migration.
+- **Date:** Unknown; specified in proposal and former decision log.
+- **Status:** proposed
+- **Context:** Concurrent operations, retries, and ownership changes need deterministic replay and stale-writer rejection.
+- **Decision:** Future drawing operations should use unique operation IDs, monotonically increasing per-tile positions, and epochs that advance when tile ownership changes.
+- **Alternatives considered:** Unordered cross-node writes or claiming exactly-once network delivery. The proposal instead calls for retry-safe idempotent processing and explicit epochs.
+- **Rationale:** The fields make ordering and duplicate handling explicit.
+- **Consequences/trade-offs:** These fields and guarantees do not exist in current code; do not infer them from Docker service separation.
+- **References:** Proposal PDFs; future work only.
 
-### D-014 — Validation
-- **Decision:** Test concurrent drawing, duplicate delivery, stale-owner writes, node addition/restart, migration, and shard crash during migration. Compare recovered canvas hashes and selected timelapse frames with a reference history.
-- **Status:** Planned.
+### ADR-008 — Plan live migration and interrupted-migration recovery
 
-## 3. Current known limitations
-1. The current prototype is single-process and in-memory.
-2. The WebSocket broadcast manager is local to one backend process; it does not coordinate multiple server processes.
-3. Session IDs are not authenticated human identities, and the in-memory session registry is lost on process restart.
-4. WebSocket broadcasts are ordered only within this one process; there is no cross-process fan-out.
-5. No durable operation log, snapshot/replay, sharding, ownership epochs, or migration recovery is implemented yet.
-6. A shared canvas needs a defined ordering policy for concurrent writes and clear operations before correctness can be guaranteed.
+- **Date:** Unknown; specified in proposal and former decision log.
+- **Status:** proposed
+- **Context:** Rebalancing must not lose writes while users draw or while a source/destination fails.
+- **Decision:** The future migration protocol should persist progress, transfer state and log position, account for writes during transfer, and hand off ownership only when the destination is ready.
+- **Alternatives considered:** Stop drawing during migration or switch ownership before destination readiness. Those choices either interrupt use or risk losing updates.
+- **Rationale:** Live migration and crash recovery are central project goals.
+- **Consequences/trade-offs:** No migration manager, protocol, or recovery mechanism exists yet.
+- **References:** Proposal PDFs; future work only.
 
-## 4. Immediate next steps
-1. Introduce a tile ownership map and route operations to independent shard processes.
-2. Add operation IDs, epochs, and per-tile positions.
-3. Add SQLite logging and restart/replay tests.
-4. Implement migration with persisted progress and failure-injection tests.
+### ADR-009 — Plan durable operation logs, snapshots, and replay
 
-## 5. Decision log maintenance
-When a design changes, update the relevant decision and its status rather than silently rewriting history. Record the date, rationale, trade-offs, and any migration steps needed for existing code.
+- **Date:** Unknown; specified in proposal and former decision log.
+- **Status:** proposed
+- **Context:** In-memory canvas state is lost on restart, and recovery needs a repeatable source of truth.
+- **Decision:** The proposed canvas persistence design uses SQLite operation history and snapshots, then replays later operations.
+- **Alternatives considered:** Save only a flattened image or keep only in-memory state. An image loses operation history; memory does not survive restart.
+- **Rationale:** Logs and snapshots can restore current state and retain a history for verification.
+- **Consequences/trade-offs:** The Phase 2 shard sample-record table is not an operation log and does not persist the canvas.
+- **References:** Proposal PDFs; `shard/main.py` is infrastructure-only.
+
+### ADR-010 — Plan undo, history outputs, and distributed correctness tests
+
+- **Date:** Unknown; specified in proposal.
+- **Status:** proposed
+- **Context:** The course asks for safe user operations, reproducible failure cases, and ways to check recovered results.
+- **Decision:** Plan eligible user-aware undo; deterministic tests for concurrency, duplicate IDs, stale epochs, restart, and source/destination failures; and later hash/timelapse comparisons after replay.
+- **Alternatives considered:** Unconditional undo or whole-canvas clear can erase another user's later work. Testing only successful requests would miss crash and retry behavior. Detailed original alternatives were not recorded.
+- **Rationale:** Operations should respect ownership and later changes, and recovery claims need comparison to expected history.
+- **Consequences/trade-offs:** Current-owner Clear exists, but undo, durable clear history, the distributed failure tests, hashes, and timelapse do not.
+- **References:** Proposal PDFs; current Clear routes in `frontend/main.py`.
+
+## Implemented decisions recorded 2026-11-02
+
+### ADR-011 — Server-issued session and current pixel ownership
+
+- **Date:** 2026-11-02 (recorded in the Phase 1 decision log).
+- **Status:** accepted
+- **Context:** Clear must distinguish each browser session, and request bodies must not choose a pixel owner.
+- **Decision:** Issue an opaque HTTP-only `canvas_session` cookie mapped to a server-generated UUID. Store each occupied pixel as one `{color, owner}` record; overwrite replaces both, and clear deletes only records currently owned by that session.
+- **Alternatives considered:** Trust a client-supplied `user_id`, identify users only by WebSocket connection, or keep separate color and owner dictionaries. These either trust the client, fail to bind HTTP actions to the same session, or risk mismatched maps.
+- **Rationale:** HTTP actions and WebSocket admission share the same server-validated session. One value keeps current color and owner together.
+- **Consequences/trade-offs:** Session IDs are not human authentication and the map is lost at coordinator restart. Cookie `Secure` is unset for local plain HTTP; a TLS deployment should enable it.
+- **References:** `frontend/main.py` `session_for`, `DrawRequest`, `draw`, `clear_my_pixels`, `websocket_endpoint`; ownership tests in `tests/test_canvas.py`.
+
+### ADR-012 — Serialize state, broadcasts, and initial snapshots
+
+- **Date:** 2026-11-02 (Phase 1 correctness audit).
+- **Status:** accepted
+- **Context:** A WebSocket could otherwise receive a mutation before an older initial snapshot; concurrent clear/draw could also display out of order.
+- **Decision:** Use one `asyncio.Lock` for state reads, mutations plus broadcasts, and WebSocket registration plus initial snapshot.
+- **Alternatives considered:** Unsynchronized snapshots, client-side sequence reconciliation, or a durable event stream. The latter two require protocol/storage work not in the prototype.
+- **Rationale:** One in-process critical section gives a simple linear order and consistent color/owner changes.
+- **Consequences/trade-offs:** A slow socket can delay other requests because sends occur under the lock. This is not cross-process ordering or distributed linearizability.
+- **References:** `frontend/main.py` `canvas_lock`, `get_state`, `draw`, `clear_my_pixels`, `websocket_endpoint`; ordering tests in `tests/test_canvas.py`.
+
+### ADR-013 — Docker Compose services and bridge-network discovery
+
+- **Date:** 2026-11-02 (Phase 2 configuration recorded in project notes).
+- **Status:** accepted
+- **Context:** The project needs separate local service processes and a browser-facing coordinator without requiring multiple physical computers.
+- **Decision:** Define one coordinator and three copies of the shard application as independent Compose services on a dedicated bridge. Publish only coordinator port 8000. Use service DNS and configurable `SHARD_URLS` for health probes.
+- **Alternatives considered:** Logical shards inside the coordinator or manually managed multiple host processes. A logical shard doesn't test isolation; manual process startup is less repeatable.
+- **Rationale:** Compose gives named services, internal DNS, health checks, and one reproducible start command.
+- **Consequences/trade-offs:** Containers share a host failure domain. The config and images exist, but Docker CLI/engine is absent in the current environment, so live startup and DNS are unverified.
+- **References:** `docker-compose.yml`, `docker/coordinator.Dockerfile`, `docker/shard.Dockerfile`, `.env.example`, `frontend/main.py`.
+
+### ADR-014 — One SQLite file and named volume per shard
+
+- **Date:** 2026-11-02 (Phase 2 configuration recorded in project notes).
+- **Status:** accepted
+- **Context:** Infrastructure tests need persistent records and must show that shard databases are isolated.
+- **Decision:** Mount distinct named volumes (`shard1_data`, `shard2_data`, `shard3_data`) at `/data`; use `/data/shard.sqlite3` within each service. Use parameterized SQLite sample-record endpoints for verification.
+- **Alternatives considered:** Shared SQLite storage or ephemeral container files. Shared SQLite hides isolation and is not appropriate as a multi-container shared file; ephemeral data vanishes on container recreation.
+- **Rationale:** Separate Docker volumes and DB files give each shard independent persistent state.
+- **Consequences/trade-offs:** Normal `docker compose down` keeps data; `down -v` erases it. Actual volume isolation and restart durability still need the live integration test.
+- **References:** `docker-compose.yml`, `shard/main.py`, `tests/integration/test_docker_services.py`.
+
+### ADR-015 — Live shard health probes and graceful partial status
+
+- **Date:** 2026-11-02 (Phase 2 configuration recorded in project notes).
+- **Status:** accepted
+- **Context:** A dashboard must report actual shard reachability and remain useful if one shard is down.
+- **Decision:** Probe each configured `/health` endpoint concurrently with bounded HTTPX timeouts; return per-service healthy, unhealthy, or unavailable status from `/admin/shards`.
+- **Alternatives considered:** Return hardcoded healthy data, use coordinator localhost for inter-container calls, or fail the entire route when one shard is down. These do not provide live service discovery or partial health.
+- **Rationale:** Docker service names resolve within the bridge, while per-shard results make partial failure visible.
+- **Consequences/trade-offs:** Bad `SHARD_URLS` syntax remains an operator configuration error. Real Docker DNS behavior hasn't been checked in this environment.
+- **References:** `frontend/main.py` `configured_shards`, `inspect_shard`, `shard_health_overview`; `shard/main.py` `health`.
+
+### ADR-016 — Keep Phase 2 shard API infrastructure-only
+
+- **Date:** 2026-11-02 (Phase 2 scope).
+- **Status:** accepted
+- **Context:** Validate containers, network, and storage before implementing canvas consistency across shards.
+- **Decision:** Shard endpoints expose identity, health, and sample records only. Canvas draw and clear remain coordinator-local.
+- **Alternatives considered:** Add tile mapping/routing in the same phase. Combining it with unverified container foundations would make failures harder to isolate.
+- **Rationale:** A narrow infrastructure API verifies process and storage boundaries without implying tile ownership exists.
+- **Consequences/trade-offs:** Shards currently do not receive canvas operations. Tile routing, epochs, migration, recovery, and undo remain future work.
+- **References:** `shard/main.py`, `frontend/main.py`, `ARCHITECTURE.md`, `FOLLOW_ALONG.md`.
+
+## Maintaining this log
+
+Append a new ADR for each significant future architecture choice. Do not delete a historic record when code changes; mark it superseded or deprecated and append the replacement. Use an exact date when known and **Unknown** otherwise. Do not mark a proposal accepted until code and tests support its claims.

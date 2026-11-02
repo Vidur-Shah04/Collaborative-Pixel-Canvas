@@ -1,0 +1,107 @@
+services:
+  coordinator:
+    build:
+      context: .
+      dockerfile: docker/coordinator.Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      SHARD_URLS: ${SHARD_URLS:-}
+    depends_on:
+      - shard-1
+      - shard-2
+      - shard-3
+    networks:
+      - canvas-net
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  shard-1:
+    build:
+      context: .
+      dockerfile: docker/shard.Dockerfile
+    environment:
+      SHARD_ID: shard-1
+      PORT: "8001"
+      SHARD_DB_PATH: /data/shard.sqlite3
+    volumes:
+      - shard1_data:/data
+    networks:
+      - canvas-net
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=2)"
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
+  shard-2:
+    build:
+      context: .
+      dockerfile: docker/shard.Dockerfile
+    environment:
+      SHARD_ID: shard-2
+      PORT: "8002"
+      SHARD_DB_PATH: /data/shard.sqlite3
+    volumes:
+      - shard2_data:/data
+    networks:
+      - canvas-net
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/health', timeout=2)"
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
+  shard-3:
+    build:
+      context: .
+      dockerfile: docker/shard.Dockerfile
+    environment:
+      SHARD_ID: shard-3
+      PORT: "8003"
+      SHARD_DB_PATH: /data/shard.sqlite3
+    volumes:
+      - shard3_data:/data
+    networks:
+      - canvas-net
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8003/health', timeout=2)"
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
+networks:
+  canvas-net:
+    driver: bridge
+
+volumes:
+  shard1_data:
+  shard2_data:
+  shard3_data:

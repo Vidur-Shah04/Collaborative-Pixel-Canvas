@@ -23,15 +23,45 @@ def test_different_sessions_draw_and_clear_only_their_current_pixels():
 
     assert alice.get("/").status_code == 200
     assert bob.get("/").status_code == 200
-    alice.post("/draw", json={"x": 4, "y": 5, "color": "#ff0000"})
-    bob.post("/draw", json={"x": 4, "y": 5, "color": "#00ff00"})
+    alice.post("/draw", json={"x": 12, "y": 12, "color": "#ff0000"})
+    bob.post("/draw", json={"x": 12, "y": 12, "color": "#00ff00"})
     alice.post("/draw", json={"x": 9, "y": 7, "color": "#0000ff"})
 
     result = alice.delete("/clear")
 
     assert result.json() == {"status": "ok", "cleared": 1}
-    assert alice.get("/state").json()["pixels"] == {"4,5": "#00FF00"}
-    assert bob.get("/state").json()["pixels"] == {"4,5": "#00FF00"}
+    assert alice.get("/state").json()["pixels"] == {"12,12": "#00FF00"}
+    assert bob.get("/state").json()["pixels"] == {"12,12": "#00FF00"}
+
+    # The new owner may clear the overwritten pixel.
+    assert bob.delete("/clear").json() == {"status": "ok", "cleared": 1}
+    assert alice.get("/state").json()["pixels"] == {}
+
+
+def test_clear_removes_unoverwritten_pixels_and_repeated_clear_is_a_noop():
+    client = TestClient(main.app)
+    client.get("/")
+    client.post("/draw", json={"x": 12, "y": 12, "color": "#ff0000"})
+    client.post("/draw", json={"x": 13, "y": 12, "color": "#0000ff"})
+
+    assert client.delete("/clear").json() == {"status": "ok", "cleared": 2}
+    assert client.get("/state").json()["pixels"] == {}
+    assert client.delete("/clear").json() == {"status": "ok", "cleared": 0}
+
+
+def test_clear_only_removes_its_owner_when_users_have_distinct_pixels():
+    alice = TestClient(main.app)
+    bob = TestClient(main.app)
+    alice.get("/")
+    bob.get("/")
+    alice.post("/draw", json={"x": 1, "y": 1, "color": "#ff0000"})
+    alice.post("/draw", json={"x": 2, "y": 2, "color": "#ff0000"})
+    bob.post("/draw", json={"x": 3, "y": 3, "color": "#00ff00"})
+
+    assert alice.delete("/clear").json()["cleared"] == 2
+    assert bob.get("/state").json()["pixels"] == {"3,3": "#00FF00"}
+    assert bob.delete("/clear").json()["cleared"] == 1
+    assert alice.get("/state").json()["pixels"] == {}
 
 
 def test_draw_validates_canvas_coordinates_and_hex_color():
@@ -77,6 +107,10 @@ def test_two_browser_sessions_have_distinct_server_generated_ids():
     assert alice_id != bob_id
     assert alice_id != alice.cookies[main.SESSION_COOKIE]
     assert bob_id != bob.cookies[main.SESSION_COOKIE]
+
+    # An extra client-supplied identity field cannot claim another session's pixels.
+    alice.post("/draw", json={"x": 20, "y": 20, "color": "#ff0000", "user_id": bob_id})
+    assert main.pixels["20,20"]["owner"] == alice_id
 
 
 def test_websocket_requires_a_server_registered_session():
@@ -165,6 +199,51 @@ def test_draw_waits_until_websocket_initial_snapshot_is_sent():
             {"type": "draw", "x": 7, "y": 8, "color": "#ABCDEF"},
         ]
         assert main.manager.active_connections == []
+
+    asyncio.run(scenario())
+
+
+def test_concurrent_clear_waits_for_inflight_draw_broadcast_and_leaves_consistent_state():
+    async def scenario():
+        token, user_id = main.session_for(None)
+        draw_broadcast_started = asyncio.Event()
+        allow_draw_broadcast = asyncio.Event()
+
+        class PausingWebSocket:
+            messages = []
+
+            async def send_json(self, message):
+                self.messages.append(message)
+                if message["type"] == "draw":
+                    draw_broadcast_started.set()
+                    await allow_draw_broadcast.wait()
+
+        websocket = PausingWebSocket()
+        main.manager.active_connections.append(websocket)
+        scope = {
+            "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+            "method": "POST", "scheme": "http", "path": "/draw", "raw_path": b"/draw",
+            "query_string": b"", "headers": [(b"cookie", f"{main.SESSION_COOKIE}={token}".encode())],
+            "server": ("testserver", 80), "client": ("testclient", 123),
+        }
+        draw_task = asyncio.create_task(
+            main.draw(main.DrawRequest(x=12, y=12, color="#ff0000"), StarletteRequest(scope))
+        )
+        await draw_broadcast_started.wait()
+        assert main.pixels["12,12"] == {"color": "#FF0000", "owner": user_id}
+
+        clear_scope = {**scope, "method": "DELETE", "path": "/clear", "raw_path": b"/clear"}
+        clear_task = asyncio.create_task(main.clear_my_pixels(StarletteRequest(clear_scope)))
+        await asyncio.sleep(0)
+        assert not clear_task.done()
+
+        allow_draw_broadcast.set()
+        await draw_task
+        clear_response = await clear_task
+
+        assert clear_response.body == b'{"status":"ok","cleared":1}'
+        assert main.pixels == {}
+        assert [message["type"] for message in websocket.messages] == ["draw", "clear"]
 
     asyncio.run(scenario())
 

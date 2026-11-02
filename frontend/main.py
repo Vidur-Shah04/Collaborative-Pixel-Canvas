@@ -7,9 +7,11 @@ and durable storage work is planned for later phases.
 from pathlib import Path
 import asyncio
 import logging
+import os
 import secrets
 import uuid
 
+import httpx
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
@@ -20,10 +22,6 @@ logger = logging.getLogger(__name__)
 class ConnectionManager:
     def __init__(self) -> None:
         self.active_connections: list[WebSocket] = []
-
-    async def connect(self, websocket: WebSocket) -> None:
-        await websocket.accept()
-        self.active_connections.append(websocket)
 
     def disconnect(self, websocket: WebSocket) -> None:
         if websocket in self.active_connections:
@@ -49,6 +47,12 @@ sessions: dict[str, str] = {}
 # Coordinate -> {color, owner}. Last committed draw wins in this prototype.
 pixels: dict[str, dict[str, str]] = {}
 SESSION_COOKIE = "canvas_session"
+DEFAULT_SHARD_URLS = (
+    "shard-1=http://shard-1:8001,"
+    "shard-2=http://shard-2:8002,"
+    "shard-3=http://shard-3:8003"
+)
+SHARD_HEALTH_TIMEOUT = httpx.Timeout(connect=1.0, read=2.0, write=1.0, pool=1.0)
 
 
 class DrawRequest(BaseModel):
@@ -69,6 +73,55 @@ def session_for(token: str | None) -> tuple[str, str]:
 
 def public_pixels() -> dict[str, str]:
     return {key: value["color"] for key, value in pixels.items()}
+
+
+def configured_shards() -> list[tuple[str, str]]:
+    """Parse comma-separated shard-id=base-url entries from environment."""
+    raw = os.getenv("SHARD_URLS") or DEFAULT_SHARD_URLS
+    targets: list[tuple[str, str]] = []
+    for entry in raw.split(","):
+        shard_id, separator, url = entry.strip().partition("=")
+        if not separator or not shard_id.strip() or not url.strip():
+            raise ValueError("SHARD_URLS entries must use shard-id=http(s)://host:port")
+        targets.append((shard_id.strip(), url.strip().rstrip("/")))
+    return targets
+
+
+async def inspect_shard(shard_id: str, url: str) -> dict:
+    result = {"shard_id": shard_id, "url": url}
+    try:
+        async with httpx.AsyncClient(timeout=SHARD_HEALTH_TIMEOUT) as client:
+            response = await client.get(f"{url}/health")
+            response.raise_for_status()
+        health = response.json()
+        if (
+            not isinstance(health, dict)
+            or health.get("shard_id") != shard_id
+            or health.get("status") != "healthy"
+        ):
+            return {**result, "status": "unhealthy", "detail": "shard identity or health check mismatch"}
+        return {
+            **result,
+            "status": "healthy",
+            "database": health.get("database", "unknown"),
+            "version": health.get("version", "unknown"),
+        }
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning("Shard health check failed for %s at %s: %s", shard_id, url, exc)
+        return {**result, "status": "unavailable", "detail": str(exc) or type(exc).__name__}
+
+
+@app.get("/health")
+def coordinator_health() -> dict:
+    return {"service": "coordinator", "status": "healthy"}
+
+
+@app.get("/admin/shards")
+async def shard_health_overview() -> dict:
+    shards = await asyncio.gather(
+        *(inspect_shard(shard_id, url) for shard_id, url in configured_shards())
+    )
+    return {"shards": shards}
 
 
 @app.get("/")

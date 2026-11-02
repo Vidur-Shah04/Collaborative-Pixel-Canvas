@@ -1,8 +1,8 @@
 # Collaborative Pixel Canvas — Decision Log
 
 **Project:** Distributed Systems course project  
-**Status:** Initial prototype  
-**Last updated:** 2026-10-28
+**Status:** Phase 1 foundation
+**Last updated:** 2026-11-02
 
 This document records decisions made so far. It distinguishes implemented prototype behavior from planned architecture so teammates do not assume unfinished distributed features already exist.
 
@@ -29,15 +29,14 @@ This document records decisions made so far. It distinguishes implemented protot
 - **Status:** Basic broadcast prototype works with two browser windows.
 
 ### D-005 — User identity
-- **Decision:** The current prototype assigns a random ID to each WebSocket connection.
-- **Important limitation:** This identifies a connection/session, not a verified or persistent human user. Reconnecting creates a new ID unless session persistence is added.
-- **Security note:** Do not trust a client-supplied `user_id` in a production system. The backend should associate HTTP requests with a server-validated session.
-- **Status:** Prototype design; verify that the session ID is correctly bound to drawing and clear requests in the current code.
+- **Decision:** The server issues a random HTTP-only cookie token and maps it to a server-side session ID. HTTP draw/clear requests and WebSockets use this session; request bodies cannot choose a user ID.
+- **Limitation:** The registry is in memory, so restart invalidates sessions. This identifies a browser session, not a human account.
+- **Status:** Implemented for the single-process prototype.
 
 ### D-006 — Pixel ownership and user-specific clear
 - **Decision:** Track the current owner of each painted coordinate separately from its colour. A clear request should remove only pixels currently owned by the requesting user and broadcast the affected coordinates so all clients update.
 - **Conflict rule:** If user B overwrites a pixel last drawn by user A, B becomes its current owner. Clearing A must not remove that pixel.
-- **Status:** Planned/being implemented. Test this behavior before treating it as complete.
+- **Status:** Implemented and covered by automated tests. Ownership metadata remains in process memory rather than durable history.
 - **Scope clarification:** This is a current-owner model, not a complete operation-history model. Undo and durable history require additional records.
 
 ### D-007 — Initial state storage

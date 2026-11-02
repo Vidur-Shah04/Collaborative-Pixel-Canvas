@@ -6,15 +6,15 @@ This guide describes the current prototype and how a teammate can run it on anot
 
 ## 1. Current status and scope
 
-The current prototype uses:
+The current Phase 1 prototype uses:
 - Python, FastAPI, and Uvicorn
 - HTML/CSS/JavaScript and the browser Canvas API
 - HTTP for drawing/state/clear requests
 - WebSockets for live updates between browsers connected to the same backend process
 
-The basic canvas and live updates have been tested in two browser windows. User-specific clear is the current change being developed and must be tested after integrating it.
+The canvas supports server-issued HTTP-only browser sessions, live updates, and user-specific clear. Pixels retain the session that last drew them, so a clear preserves pixels another session has overwritten. Focused tests cover these behaviors.
 
-**Not implemented yet:** distributed shard processes, tile migration, durable SQLite logs, snapshots, replay, operation deduplication, ownership epochs, and crash recovery. Do not treat the prototype as the completed distributed system.
+**Not implemented yet:** Docker shard processes, tile migration, durable SQLite logs, snapshots, replay, operation deduplication, ownership epochs, undo, and crash recovery. Canvas and session state are still in memory and are lost on restart. Do not treat this prototype as the completed distributed system.
 
 ## 2. Requirements
 
@@ -24,11 +24,7 @@ The basic canvas and live updates have been tested in two browser windows. User-
 - Internet access during initial dependency installation
 - Git (recommended for sharing changes with your teammate)
 
-Python packages used by the current backend:
-- `fastapi`
-- `uvicorn[standard]` (includes useful development/reload and WebSocket support)
-
-The proposal's later stages may also use `numpy`, `Pillow`, and Python's built-in `sqlite3`; add those when implementing those features rather than installing everything now.
+Install the packages listed in `requirements.txt`: `fastapi`, `uvicorn[standard]`, `httpx`, `pytest`, and `pytest-asyncio`.
 
 ## 3. Project structure
 
@@ -129,7 +125,7 @@ Open `http://127.0.0.1:8000/`.
 2. Draw a few pixels and change colours.
 3. Open the same URL in a second browser tab/window.
 4. Draw in one browser and confirm the other receives the update.
-5. Test the clear behavior implemented in your current code.
+5. Draw in both sessions, then clear one and confirm the other session's pixels remain.
 6. Open `http://127.0.0.1:8000/docs` to inspect HTTP API endpoints.
 7. In the terminal, successful requests should generally show `200 OK`; WebSocket connections should remain open.
 

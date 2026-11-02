@@ -1,43 +1,47 @@
+"""Single-process collaborative canvas prototype.
+
+The in-memory stores here are intentionally temporary. The coordinator/shard
+and durable storage work is planned for later phases.
+"""
+
 from pathlib import Path
+import secrets
 import uuid
-from fastapi import Query
-from fastapi import FastAPI
-from fastapi.responses import FileResponse
+
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
-from fastapi import WebSocket, WebSocketDisconnect
+
 
 class ConnectionManager:
-    def __init__(self):
+    def __init__(self) -> None:
         self.active_connections: list[WebSocket] = []
 
-    async def connect(self, websocket: WebSocket):
+    async def connect(self, websocket: WebSocket) -> None:
         await websocket.accept()
         self.active_connections.append(websocket)
 
-    def disconnect(self, websocket: WebSocket):
+    def disconnect(self, websocket: WebSocket) -> None:
         if websocket in self.active_connections:
             self.active_connections.remove(websocket)
 
-    async def broadcast(self, message: dict):
-        failed = []
-
+    async def broadcast(self, message: dict) -> None:
         for connection in self.active_connections.copy():
             try:
                 await connection.send_json(message)
             except Exception:
-                failed.append(connection)
-
-        for connection in failed:
-            self.disconnect(connection)
+                self.disconnect(connection)
 
 
 manager = ConnectionManager()
-
 app = FastAPI(title="Collaborative Pixel Canvas")
 
-# Temporary in-memory storage.
-# Later, each shard will own and persist its assigned tiles.
-pixels: dict[str, str] = {}
+# Session tokens are issued by the server and never accepted from request bodies.
+# This in-memory registry, like the canvas, is reset when the process restarts.
+sessions: dict[str, str] = {}
+# Coordinate -> {color, owner}. Last committed draw wins in this prototype.
+pixels: dict[str, dict[str, str]] = {}
+SESSION_COOKIE = "canvas_session"
 
 
 class DrawRequest(BaseModel):
@@ -46,64 +50,74 @@ class DrawRequest(BaseModel):
     color: str = Field(pattern=r"^#[0-9A-Fa-f]{6}$")
 
 
+def session_for(token: str | None) -> tuple[str, str]:
+    """Return a known session token and user ID, issuing them when necessary."""
+    if token is not None and token in sessions:
+        return token, sessions[token]
+    new_token = secrets.token_urlsafe(32)
+    user_id = str(uuid.uuid4())
+    sessions[new_token] = user_id
+    return new_token, user_id
+
+
+def public_pixels() -> dict[str, str]:
+    return {key: value["color"] for key, value in pixels.items()}
+
+
 @app.get("/")
-def home():
-    return FileResponse(Path(__file__).parent / "index.html")
+def home(request: Request):
+    token, _ = session_for(request.cookies.get(SESSION_COOKIE))
+    response = FileResponse(Path(__file__).parent / "index.html")
+    response.set_cookie(SESSION_COOKIE, token, httponly=True, samesite="lax")
+    return response
 
 
 @app.get("/state")
-def get_state():
-    return {"pixels": pixels}
+def get_state(request: Request):
+    token, _ = session_for(request.cookies.get(SESSION_COOKIE))
+    response = JSONResponse({"pixels": public_pixels()})
+    response.set_cookie(SESSION_COOKIE, token, httponly=True, samesite="lax")
+    return response
 
 
 @app.post("/draw")
-async def draw(request: DrawRequest):
+async def draw(request: DrawRequest, http_request: Request):
+    token, user_id = session_for(http_request.cookies.get(SESSION_COOKIE))
     key = f"{request.x},{request.y}"
-    pixels[key] = request.color.upper()
+    color = request.color.upper()
+    pixels[key] = {"color": color, "owner": user_id}
 
-    await manager.broadcast({
-        "type": "draw",
-        "x": request.x,
-        "y": request.y,
-        "color": pixels[key],
-    })
-
-    return {
-        "status": "ok",
-        "x": request.x,
-        "y": request.y,
-        "color": pixels[key],
-    }
-
-
+    await manager.broadcast({"type": "draw", "x": request.x, "y": request.y, "color": color})
+    response = JSONResponse({"status": "ok", "x": request.x, "y": request.y, "color": color})
+    response.set_cookie(SESSION_COOKIE, token, httponly=True, samesite="lax")
+    return response
 
 
 @app.delete("/clear")
-async def clear_canvas():
-    pixels.clear()
+async def clear_my_pixels(request: Request):
+    token, user_id = session_for(request.cookies.get(SESSION_COOKIE))
+    removed = [key for key, pixel in pixels.items() if pixel["owner"] == user_id]
+    for key in removed:
+        del pixels[key]
 
-    await manager.broadcast({
-        "type": "clear",
-    })
-
-    return {"status": "ok"}
-
+    coordinates = [[int(part) for part in key.split(",")] for key in removed]
+    await manager.broadcast({"type": "clear", "pixels": coordinates})
+    response = JSONResponse({"status": "ok", "cleared": len(removed)})
+    response.set_cookie(SESSION_COOKIE, token, httponly=True, samesite="lax")
+    return response
 
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    token = websocket.cookies.get(SESSION_COOKIE)
+    if token is None or token not in sessions:
+        await websocket.close(code=1008, reason="Open the canvas to create a session")
+        return
+
     await manager.connect(websocket)
-
     try:
-        # Send the current canvas to this newly connected client.
-        await websocket.send_json({
-            "type": "state",
-            "pixels": pixels,
-        })
-
-        # Keep the connection alive.
+        await websocket.send_json({"type": "state", "pixels": public_pixels()})
         while True:
             await websocket.receive_text()
-
     except WebSocketDisconnect:
         manager.disconnect(websocket)

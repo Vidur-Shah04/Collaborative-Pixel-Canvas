@@ -64,23 +64,6 @@
       ctx.fillRect(x, y, 3, 3);
     }
 
-    async function loadState() {
-      const response = await fetch("/state");
-      if (!response.ok) throw new Error("Could not load canvas");
-      const data = await response.json();
-
-      ctx.fillStyle = "#ffffff";
-      ctx.fillRect(0, 0, 1000, 1000);
-
-      for (const [key, color] of Object.entries(data.pixels)) {
-        const [x, y] = key.split(",").map(Number);
-        paint(x, y, color);
-      }
-
-      status.textContent = "Canvas loaded";
-    }
-    
-        
     const wsProtocol =
       window.location.protocol === "https:" ? "wss:" : "ws:";
 
@@ -146,7 +129,6 @@
 
         if (!response.ok) throw new Error("Drawing failed");
 
-        paint(x, y, color);
         status.textContent = `Painted (${x}, ${y})`;
       } catch (error) {
         status.textContent = "Error: " + error.message;
@@ -166,10 +148,6 @@
         status.textContent = `Cleared ${data.cleared} of your pixels`;
       }
     );
-
-    loadState().catch(error => {
-      status.textContent = "Error: " + error.message;
-    });
   </script>
   </body>
 </html>

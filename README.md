@@ -14,6 +14,8 @@ The current Phase 1 prototype uses:
 
 The canvas supports server-issued HTTP-only browser sessions, live updates, and user-specific clear. Pixels retain the session that last drew them, so a clear preserves pixels another session has overwritten. Focused tests cover these behaviors.
 
+Session cookies use `HttpOnly` and `SameSite=Lax`. `Secure` is disabled for the local HTTP development server. HTTP requests and WebSockets validate the same cookie against the in-memory session registry; refreshing the page retains the browser cookie. WebSocket snapshots, canvas changes, and their broadcasts share one async lock. The page uses the WebSocket snapshot as its initial render source to avoid applying an older parallel state response after newer events.
+
 **Not implemented yet:** Docker shard processes, tile migration, durable SQLite logs, snapshots, replay, operation deduplication, ownership epochs, undo, and crash recovery. Canvas and session state are still in memory and are lost on restart. Do not treat this prototype as the completed distributed system.
 
 ## 2. Requirements
@@ -43,16 +45,13 @@ Collaborative Pixel Canvas/
 
 Your actual project may contain additional folders. Keep the `main.py` and `index.html` locations consistent with the paths used by the code.
 
-## 4. Create `requirements.txt`
+## 4. Install dependencies
 
-Put this file in the project root (the directory that contains `frontend/`):
+Install the project dependencies from its existing root `requirements.txt`:
 
-```text
-fastapi
-uvicorn[standard]
+```powershell
+python -m pip install -r requirements.txt
 ```
-
-For reproducible installs later, pin tested versions after the project stabilizes. For now, these direct dependencies are sufficient for the current prototype.
 
 ## 5. Windows setup (PowerShell)
 
@@ -126,8 +125,9 @@ Open `http://127.0.0.1:8000/`.
 3. Open the same URL in a second browser tab/window.
 4. Draw in one browser and confirm the other receives the update.
 5. Draw in both sessions, then clear one and confirm the other session's pixels remain.
-6. Open `http://127.0.0.1:8000/docs` to inspect HTTP API endpoints.
-7. In the terminal, successful requests should generally show `200 OK`; WebSocket connections should remain open.
+6. Run the automated tests with `python -m pytest -q tests -p no:cacheprovider`.
+7. Open `http://127.0.0.1:8000/docs` to inspect HTTP API endpoints.
+8. In the terminal, successful requests should generally show `200 OK`; WebSocket connections should remain open.
 
 If the server says `Could not import module "main"`, check the current directory and module path. For `frontend/main.py`, either run `uvicorn main:app` from inside `frontend/`, or run `uvicorn frontend.main:app` from the project root if that import path is supported.
 

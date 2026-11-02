@@ -24,9 +24,10 @@ This document records decisions made so far. It distinguishes implemented protot
 - **Status:** Implemented in the current prototype; confirm route names against the current code before relying on them.
 
 ### D-004 — Live update delivery
-- **Decision:** The backend broadcasts drawing updates and clear-related messages to connected WebSocket clients.
-- **Reason:** All connected browsers should display a shared, live view.
-- **Status:** Basic broadcast prototype works with two browser windows.
+- **Decision:** The backend serializes each canvas mutation and its broadcast with WebSocket registration and initial state delivery using one async lock. A new client receives a snapshot before later updates, and existing clients receive mutations in commit order.
+- **Reason:** A snapshot/update race could otherwise deliver an update before an older snapshot that then erases it from the browser view.
+- **Trade-off:** The lock is held while messages are sent, so a slow client can delay other canvas operations.
+- **Status:** Implemented and covered by ordering and forced-interleaving tests in the single-process prototype; all 9 tests pass with `python -m pytest -q tests -p no:cacheprovider`.
 
 ### D-005 — User identity
 - **Decision:** The server issues a random HTTP-only cookie token and maps it to a server-side session ID. HTTP draw/clear requests and WebSockets use this session; request bodies cannot choose a user ID.
@@ -79,19 +80,16 @@ This document records decisions made so far. It distinguishes implemented protot
 ## 3. Current known limitations
 1. The current prototype is single-process and in-memory.
 2. The WebSocket broadcast manager is local to one backend process; it does not coordinate multiple server processes.
-3. Connection IDs are not persistent authenticated identities.
-4. Per-user clear depends on accurate server-side ownership metadata and correct broadcast handling.
+3. Session IDs are not authenticated human identities, and the in-memory session registry is lost on process restart.
+4. WebSocket broadcasts are ordered only within this one process; there is no cross-process fan-out.
 5. No durable operation log, snapshot/replay, sharding, ownership epochs, or migration recovery is implemented yet.
 6. A shared canvas needs a defined ordering policy for concurrent writes and clear operations before correctness can be guaranteed.
 
 ## 4. Immediate next steps
-1. Verify user-specific clear across two browsers, including the overwrite case.
-2. Keep API message formats documented and consistent between frontend and backend.
-3. Add automated tests for tile coordinate mapping.
-4. Introduce a tile ownership map and route operations to two local shard processes.
-5. Add operation IDs, epochs, and per-tile positions.
-6. Add SQLite logging and restart/replay tests.
-7. Implement migration with persisted progress and failure-injection tests.
+1. Introduce a tile ownership map and route operations to independent shard processes.
+2. Add operation IDs, epochs, and per-tile positions.
+3. Add SQLite logging and restart/replay tests.
+4. Implement migration with persisted progress and failure-injection tests.
 
 ## 5. Decision log maintenance
 When a design changes, update the relevant decision and its status rather than silently rewriting history. Record the date, rationale, trade-offs, and any migration steps needed for existing code.

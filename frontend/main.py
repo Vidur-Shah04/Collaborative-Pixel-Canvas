@@ -5,12 +5,16 @@ and durable storage work is planned for later phases.
 """
 
 from pathlib import Path
+import asyncio
+import logging
 import secrets
 import uuid
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
 
 
 class ConnectionManager:
@@ -30,11 +34,14 @@ class ConnectionManager:
             try:
                 await connection.send_json(message)
             except Exception:
+                logger.exception("WebSocket broadcast failed; dropping connection")
                 self.disconnect(connection)
 
 
 manager = ConnectionManager()
 app = FastAPI(title="Collaborative Pixel Canvas")
+# Serializes state changes and their broadcasts with WebSocket state snapshots.
+canvas_lock = asyncio.Lock()
 
 # Session tokens are issued by the server and never accepted from request bodies.
 # This in-memory registry, like the canvas, is reset when the process restarts.
@@ -45,8 +52,8 @@ SESSION_COOKIE = "canvas_session"
 
 
 class DrawRequest(BaseModel):
-    x: int = Field(ge=0, lt=1000)
-    y: int = Field(ge=0, lt=1000)
+    x: int = Field(strict=True, ge=0, lt=1000)
+    y: int = Field(strict=True, ge=0, lt=1000)
     color: str = Field(pattern=r"^#[0-9A-Fa-f]{6}$")
 
 
@@ -73,9 +80,11 @@ def home(request: Request):
 
 
 @app.get("/state")
-def get_state(request: Request):
+async def get_state(request: Request):
     token, _ = session_for(request.cookies.get(SESSION_COOKIE))
-    response = JSONResponse({"pixels": public_pixels()})
+    async with canvas_lock:
+        state = public_pixels()
+    response = JSONResponse({"pixels": state})
     response.set_cookie(SESSION_COOKIE, token, httponly=True, samesite="lax")
     return response
 
@@ -85,9 +94,9 @@ async def draw(request: DrawRequest, http_request: Request):
     token, user_id = session_for(http_request.cookies.get(SESSION_COOKIE))
     key = f"{request.x},{request.y}"
     color = request.color.upper()
-    pixels[key] = {"color": color, "owner": user_id}
-
-    await manager.broadcast({"type": "draw", "x": request.x, "y": request.y, "color": color})
+    async with canvas_lock:
+        pixels[key] = {"color": color, "owner": user_id}
+        await manager.broadcast({"type": "draw", "x": request.x, "y": request.y, "color": color})
     response = JSONResponse({"status": "ok", "x": request.x, "y": request.y, "color": color})
     response.set_cookie(SESSION_COOKIE, token, httponly=True, samesite="lax")
     return response
@@ -96,12 +105,13 @@ async def draw(request: DrawRequest, http_request: Request):
 @app.delete("/clear")
 async def clear_my_pixels(request: Request):
     token, user_id = session_for(request.cookies.get(SESSION_COOKIE))
-    removed = [key for key, pixel in pixels.items() if pixel["owner"] == user_id]
-    for key in removed:
-        del pixels[key]
+    async with canvas_lock:
+        removed = [key for key, pixel in pixels.items() if pixel["owner"] == user_id]
+        for key in removed:
+            del pixels[key]
 
-    coordinates = [[int(part) for part in key.split(",")] for key in removed]
-    await manager.broadcast({"type": "clear", "pixels": coordinates})
+        coordinates = [[int(part) for part in key.split(",")] for key in removed]
+        await manager.broadcast({"type": "clear", "pixels": coordinates})
     response = JSONResponse({"status": "ok", "cleared": len(removed)})
     response.set_cookie(SESSION_COOKIE, token, httponly=True, samesite="lax")
     return response
@@ -114,10 +124,20 @@ async def websocket_endpoint(websocket: WebSocket):
         await websocket.close(code=1008, reason="Open the canvas to create a session")
         return
 
-    await manager.connect(websocket)
     try:
-        await websocket.send_json({"type": "state", "pixels": public_pixels()})
+        await websocket.accept()
+        # Register and snapshot under the same lock as mutations+broadcasts.
+        # A mutation is therefore either included in this snapshot or delivered
+        # after it as a WebSocket event, never lost between the two.
+        async with canvas_lock:
+            manager.active_connections.append(websocket)
+            await websocket.send_json({"type": "state", "pixels": public_pixels()})
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
+        pass
+    except Exception:
+        # Failed sends and other connection errors must not leak stale sockets.
+        logger.exception("WebSocket session ended unexpectedly")
+    finally:
         manager.disconnect(websocket)

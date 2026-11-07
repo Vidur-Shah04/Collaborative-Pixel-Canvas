@@ -9,7 +9,7 @@ import uuid
 import sqlite3
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 from shared.tiles import TILE_COLUMNS, TILE_ROWS, TileAddress, configured_shard_ids, shard_for_tile, tile_for_pixel
@@ -64,6 +64,78 @@ def ownership_for_tile(tile: TileAddress) -> tuple[str, int]:
                            (tile.tile_id, shard_for_tile(tile)))
         row = connection.execute("SELECT shard_id, epoch FROM tile_owners WHERE tile_id = ?", (tile.tile_id,)).fetchone()
     return row[0], row[1]
+
+
+def ownership_db() -> sqlite3.Connection:
+    OWNERSHIP_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(OWNERSHIP_DB_PATH, timeout=5.0)
+    connection.row_factory = sqlite3.Row
+    connection.execute("""CREATE TABLE IF NOT EXISTS transfers (
+        tile_id TEXT PRIMARY KEY, source TEXT NOT NULL, destination TEXT NOT NULL,
+        old_epoch INTEGER NOT NULL, phase TEXT NOT NULL)""")
+    return connection
+
+
+def pending_transfer(tile_id: str) -> sqlite3.Row | None:
+    with ownership_db() as connection:
+        return connection.execute("SELECT * FROM transfers WHERE tile_id = ?", (tile_id,)).fetchone()
+
+
+async def transfer_tile(tile: TileAddress, destination: str) -> dict:
+    """Resume a fenced single-tile transfer until its new owner is active."""
+    async with canvas_lock:
+        if destination not in configured_shard_ids():
+            raise HTTPException(status_code=422, detail="unknown destination shard")
+        owner, epoch = ownership_for_tile(tile)
+        with ownership_db() as connection:
+            transfer = connection.execute("SELECT * FROM transfers WHERE tile_id = ?", (tile.tile_id,)).fetchone()
+            if transfer is None:
+                if destination == owner:
+                    return {"tile_id": tile.tile_id, "owner": owner, "epoch": epoch}
+                connection.execute("INSERT INTO transfers VALUES (?, ?, ?, ?, 'preparing')",
+                                   (tile.tile_id, owner, destination, epoch))
+                source, old_epoch = owner, epoch
+            else:
+                if transfer["destination"] != destination:
+                    raise HTTPException(status_code=409, detail="different transfer pending")
+                source, old_epoch = transfer["source"], transfer["old_epoch"]
+        # Source fence commits before any destination activation. Repeatable after
+        # a crash; the source's snapshot is stable once fenced.
+        await request_shard(source, "POST", f"/tiles/{tile.tile_id}/fence", params={"epoch": old_epoch})
+        with ownership_db() as connection:
+            connection.execute("UPDATE transfers SET phase = 'fenced' WHERE tile_id = ?", (tile.tile_id,))
+        snapshot = await request_shard(source, "GET", f"/tiles/{tile.tile_id}/snapshot")
+        operations = []
+        after = 0
+        while True:
+            page = await request_shard(source, "GET", f"/tiles/{tile.tile_id}/operations",
+                                       params={"after": after, "limit": 1000})
+            batch = page["operations"]
+            operations.extend(batch)
+            if not batch:
+                break
+            after = batch[-1]["sequence"]
+        try:
+            destination_snapshot = await request_shard(destination, "GET", f"/tiles/{tile.tile_id}/snapshot")
+        except ShardRequestError as exc:
+            if exc.status_code != 404:
+                raise
+            destination_snapshot = None
+        if not destination_snapshot or not destination_snapshot["active"]:
+            await request_shard(destination, "POST", f"/tiles/{tile.tile_id}/install",
+                                body={"epoch": old_epoch + 1, "last_sequence": snapshot["last_sequence"],
+                                      "pixels": snapshot["pixels"], "operations": operations})
+        elif (destination_snapshot["epoch"] != old_epoch + 1 or
+              destination_snapshot["last_sequence"] < snapshot["last_sequence"]):
+            raise HTTPException(status_code=409, detail="destination state does not match transfer")
+        with ownership_db() as connection:
+            connection.execute("UPDATE transfers SET phase = 'installed' WHERE tile_id = ?", (tile.tile_id,))
+        await request_shard(destination, "POST", f"/tiles/{tile.tile_id}/activate", params={"epoch": old_epoch + 1})
+        with ownership_db() as connection:
+            connection.execute("UPDATE tile_owners SET shard_id = ?, epoch = ? WHERE tile_id = ?",
+                               (destination, old_epoch + 1, tile.tile_id))
+            connection.execute("DELETE FROM transfers WHERE tile_id = ?", (tile.tile_id,))
+        return {"tile_id": tile.tile_id, "owner": destination, "epoch": old_epoch + 1}
 
 
 class ShardRequestError(Exception):
@@ -142,7 +214,7 @@ async def request_shard(
         return result
     except httpx.HTTPStatusError as exc:
         logger.warning("Shard %s rejected %s %s: %s", shard_id, method, path, exc)
-        raise ShardRequestError(shard_id, "owner shard rejected the request", 502) from exc
+        raise ShardRequestError(shard_id, "owner shard rejected the request", exc.response.status_code) from exc
     except (httpx.HTTPError, ValueError) as exc:
         logger.warning("Shard request failed for %s: %s %s: %s", shard_id, method, path, exc)
         raise ShardRequestError(shard_id, "owner shard is unavailable", 503) from exc
@@ -155,12 +227,13 @@ async def load_pixels_from_shards() -> dict[str, dict[str, str]]:
         *(request_shard(shard_id, "GET", "/pixels") for shard_id in shard_ids)
     )
     state: dict[str, dict[str, str]] = {}
-    for result in results:
+    for shard_id, result in zip(shard_ids, results):
         for pixel in result.get("pixels", []):
-            state[f"{pixel['x']},{pixel['y']}"] = {
-                "color": pixel["color"],
-                "owner": pixel["owner"],
-            }
+            tile = tile_for_pixel(pixel["x"], pixel["y"])
+            if ownership_for_tile(tile)[0] == shard_id:
+                state[f"{pixel['x']},{pixel['y']}"] = {
+                    "color": pixel["color"], "owner": pixel["owner"],
+                }
     return state
 
 
@@ -201,6 +274,19 @@ async def shard_health_overview() -> dict:
     return {"shards": shards}
 
 
+@app.post("/admin/tiles/{x}/{y}/transfer")
+async def transfer_endpoint(x: int, y: int, destination: str,
+                            x_admin_token: str | None = Header(default=None)) -> dict:
+    expected_token = os.getenv("ADMIN_TOKEN")
+    if not expected_token or not secrets.compare_digest(x_admin_token or "", expected_token):
+        raise HTTPException(status_code=403, detail="admin token required")
+    try:
+        tile = tile_for_pixel(x, y)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return await transfer_tile(tile, destination)
+
+
 @app.get("/")
 def home(request: Request):
     token, _ = session_for(request.cookies.get(SESSION_COOKIE))
@@ -228,12 +314,14 @@ async def get_state(request: Request):
 async def draw(request: DrawRequest, http_request: Request):
     token, user_id = session_for(http_request.cookies.get(SESSION_COOKIE))
     tile = tile_for_pixel(request.x, request.y)
-    shard_id, epoch = ownership_for_tile(tile)
     color = request.color.upper()
     operation_id = request.operation_id or str(uuid.uuid4())
     key = f"{request.x},{request.y}"
     try:
         async with canvas_lock:
+            if pending_transfer(tile.tile_id):
+                raise HTTPException(status_code=503, detail="tile transfer pending; retry later")
+            shard_id, epoch = ownership_for_tile(tile)
             committed = await request_shard(
                 shard_id,
                 "POST",
@@ -252,12 +340,11 @@ async def draw(request: DrawRequest, http_request: Request):
                 committed.get(field) != expected
                 for field, expected in {
                     "status": "committed",
-                    "shard_id": shard_id,
                     "tile_id": tile.tile_id,
                     "color": color,
                     "owner": user_id,
                 }.items()
-            ):
+            ) or (not committed.get("duplicate") and committed.get("shard_id") != shard_id):
                 raise ShardRequestError(shard_id, "owner shard returned an invalid commit receipt", 502)
             if not committed.get("duplicate"):
                 pixels[key] = {"color": color, "owner": user_id}
@@ -279,6 +366,9 @@ async def clear_my_pixels(request: Request):
     shard_ids = configured_shard_ids()
     try:
         async with canvas_lock:
+            with ownership_db() as connection:
+                if connection.execute("SELECT 1 FROM transfers LIMIT 1").fetchone():
+                    raise HTTPException(status_code=503, detail="tile transfer pending; retry later")
             results = await asyncio.gather(
                 *(
                     request_shard(
@@ -298,8 +388,13 @@ async def clear_my_pixels(request: Request):
                 for result in results
                 for pixel in result["removed"]
             ]
-            for x, y in coordinates:
-                pixels.pop(f"{x},{y}", None)
+            # A migrated tile can leave a fenced copy on its old shard. Only
+            # broadcast removals absent from the authoritative owner now.
+            refreshed = await load_pixels_from_shards()
+            coordinates = [[x, y] for x, y in sorted({tuple(point) for point in coordinates})
+                           if f"{x},{y}" not in refreshed]
+            pixels.clear()
+            pixels.update(refreshed)
             await manager.broadcast({"type": "clear", "pixels": coordinates})
     except ShardRequestError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc

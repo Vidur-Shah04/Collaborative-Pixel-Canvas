@@ -9,6 +9,7 @@ services:
       SHARD_URLS: ${SHARD_URLS:-}
       SHARD_IDS: "${SHARD_IDS:-shard-1,shard-2,shard-3}"
       OWNERSHIP_DB_PATH: /data/ownership.sqlite3
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
     volumes:
       - coordinator_data:/data
     depends_on:

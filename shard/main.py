@@ -29,6 +29,13 @@ class PixelWriteRequest(BaseModel):
     operation_id: str | None = Field(default=None, min_length=1, max_length=100)
 
 
+class TileInstallRequest(BaseModel):
+    epoch: int = Field(ge=2)
+    last_sequence: int = Field(ge=0)
+    pixels: list[dict]
+    operations: list[dict] = []
+
+
 def create_app(
     shard_id: str | None = None,
     port: int | None = None,
@@ -156,11 +163,6 @@ def create_app(
         if pixel.tile_id != tile.tile_id:
             raise HTTPException(status_code=422, detail="tile_id does not match pixel coordinates")
         expected_owner = shard_for_tile(tile, shard_ids)
-        if expected_owner != identity:
-            raise HTTPException(
-                status_code=409,
-                detail=f"tile {tile.tile_id} is assigned to {expected_owner}",
-            )
         color = pixel.color.upper()
         operation_id = pixel.operation_id or str(uuid.uuid4())
         payload = json.dumps([pixel.x, pixel.y, tile.tile_id, color, pixel.owner], separators=(",", ":"))
@@ -173,9 +175,10 @@ def create_app(
                 if previous["payload"] != payload:
                     raise HTTPException(status_code=409, detail="operation ID reused with different payload")
                 return {**json.loads(previous["result"]), "duplicate": True}
-            connection.execute("INSERT OR IGNORE INTO tile_ownership(tile_id, epoch, next_sequence, active) VALUES (?, 1, 1, 1)", (tile.tile_id,))
+            if expected_owner == identity:
+                connection.execute("INSERT OR IGNORE INTO tile_ownership(tile_id, epoch, next_sequence, active) VALUES (?, 1, 1, 1)", (tile.tile_id,))
             ownership = connection.execute("SELECT epoch, next_sequence, active FROM tile_ownership WHERE tile_id = ?", (tile.tile_id,)).fetchone()
-            if not ownership["active"] or pixel.epoch != ownership["epoch"]:
+            if ownership is None or not ownership["active"] or pixel.epoch != ownership["epoch"]:
                 raise HTTPException(status_code=409, detail="stale or inactive tile epoch")
             sequence = ownership["next_sequence"]
             connection.execute(
@@ -215,6 +218,59 @@ def create_app(
             return {"tile_id": tile_id, "epoch": ownership["epoch"],
                     "last_sequence": ownership["next_sequence"] - 1,
                     "active": bool(ownership["active"]), "pixels": [dict(row) for row in rows]}
+
+    @service.post("/tiles/{tile_id}/fence")
+    def fence_tile(tile_id: str, epoch: int = Query(ge=1)) -> dict:
+        with database_connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if epoch == 1:
+                try:
+                    row_part, column_part = tile_id.removeprefix("tile-").split("-")
+                    tile = tile_for_pixel(int(column_part) * 25, int(row_part) * 25)
+                except (ValueError, IndexError) as exc:
+                    raise HTTPException(status_code=422, detail="invalid tile ID") from exc
+                if tile.tile_id != tile_id or shard_for_tile(tile, shard_ids) != identity:
+                    raise HTTPException(status_code=409, detail="not initial owner")
+                connection.execute("INSERT OR IGNORE INTO tile_ownership VALUES (?, 1, 1, 1)", (tile_id,))
+            row = connection.execute("SELECT epoch, next_sequence, active FROM tile_ownership WHERE tile_id = ?", (tile_id,)).fetchone()
+            if row is None or row["epoch"] != epoch:
+                raise HTTPException(status_code=409, detail="tile epoch mismatch")
+            connection.execute("UPDATE tile_ownership SET active = 0 WHERE tile_id = ?", (tile_id,))
+            return {"tile_id": tile_id, "epoch": epoch, "last_sequence": row["next_sequence"] - 1}
+
+    @service.post("/tiles/{tile_id}/install")
+    def install_tile(tile_id: str, install: TileInstallRequest) -> dict:
+        with database_connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT epoch, active FROM tile_ownership WHERE tile_id = ?", (tile_id,)).fetchone()
+            if row is not None and (row["epoch"] > install.epoch or row["active"]):
+                raise HTTPException(status_code=409, detail="destination tile already active or has different epoch")
+            for pixel in install.pixels:
+                if tile_for_pixel(pixel["x"], pixel["y"]).tile_id != tile_id:
+                    raise HTTPException(status_code=422, detail="snapshot pixel outside tile")
+            connection.execute("DELETE FROM pixels WHERE tile_id = ?", (tile_id,))
+            connection.executemany("INSERT INTO pixels VALUES (?, ?, ?, ?, ?)",
+                                   [(p["x"], p["y"], tile_id, p["color"], p["owner"]) for p in install.pixels])
+            for operation in install.operations:
+                if operation["sequence"] > install.last_sequence:
+                    raise HTTPException(status_code=422, detail="operation beyond snapshot boundary")
+                connection.execute("INSERT OR IGNORE INTO pixel_operations VALUES (?, ?, ?, ?, ?, ?)",
+                                   (operation["operation_id"], tile_id, operation["epoch"],
+                                    operation["sequence"], json.dumps(operation["payload"], separators=(",", ":")),
+                                    json.dumps(operation["result"])))
+            connection.execute("INSERT INTO tile_ownership VALUES (?, ?, ?, 0) ON CONFLICT(tile_id) DO UPDATE SET epoch = excluded.epoch, next_sequence = excluded.next_sequence, active = 0",
+                               (tile_id, install.epoch, install.last_sequence + 1))
+        return {"tile_id": tile_id, "epoch": install.epoch, "status": "prepared"}
+
+    @service.post("/tiles/{tile_id}/activate")
+    def activate_tile(tile_id: str, epoch: int = Query(ge=2)) -> dict:
+        with database_connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT epoch FROM tile_ownership WHERE tile_id = ?", (tile_id,)).fetchone()
+            if row is None or row["epoch"] != epoch:
+                raise HTTPException(status_code=409, detail="destination tile not prepared")
+            connection.execute("UPDATE tile_ownership SET active = 1 WHERE tile_id = ?", (tile_id,))
+        return {"tile_id": tile_id, "epoch": epoch, "status": "active"}
 
     @service.get("/tiles/{tile_id}/operations")
     def tile_operations(tile_id: str, after: int = Query(default=0, ge=0),

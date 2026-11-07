@@ -67,6 +67,7 @@ class DrawRequest(BaseModel):
     x: int = Field(strict=True, ge=0, lt=1000)
     y: int = Field(strict=True, ge=0, lt=1000)
     color: str = Field(pattern=r"^#[0-9A-Fa-f]{6}$")
+    operation_id: str | None = Field(default=None, min_length=1, max_length=100)
 
 
 def session_for(token: str | None) -> tuple[str, str]:
@@ -216,6 +217,7 @@ async def draw(request: DrawRequest, http_request: Request):
     tile = tile_for_pixel(request.x, request.y)
     shard_id = shard_for_tile(tile)
     color = request.color.upper()
+    operation_id = request.operation_id or str(uuid.uuid4())
     key = f"{request.x},{request.y}"
     try:
         async with canvas_lock:
@@ -229,6 +231,8 @@ async def draw(request: DrawRequest, http_request: Request):
                     "tile_id": tile.tile_id,
                     "color": color,
                     "owner": user_id,
+                    "epoch": 1,
+                    "operation_id": operation_id,
                 },
             )
             if any(
@@ -242,13 +246,15 @@ async def draw(request: DrawRequest, http_request: Request):
                 }.items()
             ):
                 raise ShardRequestError(shard_id, "owner shard returned an invalid commit receipt", 502)
-            pixels[key] = {"color": committed["color"], "owner": committed["owner"]}
-            await manager.broadcast({"type": "draw", "x": request.x, "y": request.y, "color": color})
+            if not committed.get("duplicate"):
+                pixels[key] = {"color": color, "owner": user_id}
+                await manager.broadcast({"type": "draw", "x": request.x, "y": request.y, "color": color})
     except ShardRequestError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     response = JSONResponse({
         "status": "ok", "x": request.x, "y": request.y, "color": color,
         "tile_id": tile.tile_id, "shard_id": shard_id,
+        "operation_id": operation_id, "epoch": committed.get("epoch", 1), "sequence": committed.get("sequence"),
     })
     response.set_cookie(SESSION_COOKIE, token, httponly=True, samesite="lax")
     return response

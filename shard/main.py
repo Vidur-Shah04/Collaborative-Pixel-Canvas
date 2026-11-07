@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager, contextmanager
 import os
 from pathlib import Path
 import sqlite3
+import json
 from fastapi import FastAPI, HTTPException
 from fastapi import Query
 from pydantic import BaseModel, Field
@@ -23,6 +24,8 @@ class PixelWriteRequest(BaseModel):
     tile_id: str = Field(min_length=1, max_length=32)
     color: str = Field(pattern=r"^#[0-9A-Fa-f]{6}$")
     owner: str = Field(min_length=1, max_length=100)
+    epoch: int = Field(default=1, ge=1)
+    operation_id: str | None = Field(default=None, min_length=1, max_length=100)
 
 
 def create_app(
@@ -72,6 +75,14 @@ def create_app(
                    )"""
             )
             connection.execute("CREATE INDEX IF NOT EXISTS pixels_owner_idx ON pixels(owner)")
+            connection.execute("""CREATE TABLE IF NOT EXISTS tile_ownership (
+                tile_id TEXT PRIMARY KEY, epoch INTEGER NOT NULL,
+                next_sequence INTEGER NOT NULL DEFAULT 1, active INTEGER NOT NULL DEFAULT 1)""")
+            connection.execute("""CREATE TABLE IF NOT EXISTS pixel_operations (
+                operation_id TEXT PRIMARY KEY, tile_id TEXT NOT NULL,
+                epoch INTEGER NOT NULL, sequence INTEGER NOT NULL,
+                payload TEXT NOT NULL, result TEXT NOT NULL,
+                UNIQUE(tile_id, epoch, sequence))""")
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -150,7 +161,23 @@ def create_app(
                 detail=f"tile {tile.tile_id} is assigned to {expected_owner}",
             )
         color = pixel.color.upper()
+        operation_id = pixel.operation_id
+        payload = json.dumps([pixel.x, pixel.y, tile.tile_id, color, pixel.owner], separators=(",", ":"))
         with database_connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if operation_id:
+                previous = connection.execute(
+                    "SELECT payload, result FROM pixel_operations WHERE operation_id = ?", (operation_id,)
+                ).fetchone()
+                if previous:
+                    if previous["payload"] != payload:
+                        raise HTTPException(status_code=409, detail="operation ID reused with different payload")
+                    return {**json.loads(previous["result"]), "duplicate": True}
+            connection.execute("INSERT OR IGNORE INTO tile_ownership(tile_id, epoch, next_sequence, active) VALUES (?, 1, 1, 1)", (tile.tile_id,))
+            ownership = connection.execute("SELECT epoch, next_sequence, active FROM tile_ownership WHERE tile_id = ?", (tile.tile_id,)).fetchone()
+            if not ownership["active"] or pixel.epoch != ownership["epoch"]:
+                raise HTTPException(status_code=409, detail="stale or inactive tile epoch")
+            sequence = ownership["next_sequence"]
             connection.execute(
                 """INSERT INTO pixels(x, y, tile_id, color, owner)
                    VALUES (?, ?, ?, ?, ?)
@@ -160,7 +187,7 @@ def create_app(
                      owner = excluded.owner""",
                 (pixel.x, pixel.y, tile.tile_id, color, pixel.owner),
             )
-        return {
+            result = {
             "status": "committed",
             "x": pixel.x,
             "y": pixel.y,
@@ -168,7 +195,27 @@ def create_app(
             "shard_id": identity,
             "color": color,
             "owner": pixel.owner,
-        }
+            "epoch": pixel.epoch,
+            "sequence": sequence,
+            "operation_id": operation_id,
+            }
+            connection.execute("UPDATE tile_ownership SET next_sequence = ? WHERE tile_id = ?", (sequence + 1, tile.tile_id))
+            if operation_id:
+                connection.execute("INSERT INTO pixel_operations VALUES (?, ?, ?, ?, ?, ?)",
+                                   (operation_id, tile.tile_id, pixel.epoch, sequence, payload, json.dumps(result)))
+        return result
+
+    @service.get("/tiles/{tile_id}/snapshot")
+    def tile_snapshot(tile_id: str) -> dict:
+        with database_connection() as connection:
+            connection.execute("BEGIN")
+            ownership = connection.execute("SELECT epoch, next_sequence, active FROM tile_ownership WHERE tile_id = ?", (tile_id,)).fetchone()
+            if ownership is None:
+                raise HTTPException(status_code=404, detail="tile not initialized")
+            rows = connection.execute("SELECT x, y, color, owner FROM pixels WHERE tile_id = ? ORDER BY y, x", (tile_id,)).fetchall()
+            return {"tile_id": tile_id, "epoch": ownership["epoch"],
+                    "last_sequence": ownership["next_sequence"] - 1,
+                    "active": bool(ownership["active"]), "pixels": [dict(row) for row in rows]}
 
     @service.get("/pixels")
     def list_pixels() -> dict:

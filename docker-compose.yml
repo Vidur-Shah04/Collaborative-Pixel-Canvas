@@ -8,6 +8,9 @@ services:
     environment:
       SHARD_URLS: ${SHARD_URLS:-}
       SHARD_IDS: "${SHARD_IDS:-shard-1,shard-2,shard-3}"
+      OWNERSHIP_DB_PATH: /data/ownership.sqlite3
+    volumes:
+      - coordinator_data:/data
     depends_on:
       - shard-1
       - shard-2
@@ -106,6 +109,7 @@ networks:
     driver: bridge
 
 volumes:
+  coordinator_data:
   shard1_data:
   shard2_data:
   shard3_data:

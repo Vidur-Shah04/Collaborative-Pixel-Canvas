@@ -6,12 +6,13 @@ import logging
 import os
 import secrets
 import uuid
+import sqlite3
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
-from shared.tiles import configured_shard_ids, shard_for_tile, tile_for_pixel
+from shared.tiles import TILE_COLUMNS, TILE_ROWS, TileAddress, configured_shard_ids, shard_for_tile, tile_for_pixel
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,18 @@ DEFAULT_SHARD_URLS = (
 )
 SHARD_HEALTH_TIMEOUT = httpx.Timeout(connect=1.0, read=2.0, write=1.0, pool=1.0)
 SHARD_OPERATION_TIMEOUT = httpx.Timeout(connect=1.0, read=5.0, write=5.0, pool=1.0)
+OWNERSHIP_DB_PATH = Path(os.getenv("OWNERSHIP_DB_PATH", str(Path(__file__).parent / "data" / "ownership.sqlite3")))
+
+
+def ownership_for_tile(tile: TileAddress) -> tuple[str, int]:
+    """Read the durable, fixed-set ownership record for one tile."""
+    OWNERSHIP_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(OWNERSHIP_DB_PATH, timeout=5.0) as connection:
+        connection.execute("CREATE TABLE IF NOT EXISTS tile_owners (tile_id TEXT PRIMARY KEY, shard_id TEXT NOT NULL, epoch INTEGER NOT NULL)")
+        connection.execute("INSERT OR IGNORE INTO tile_owners VALUES (?, ?, 1)",
+                           (tile.tile_id, shard_for_tile(tile)))
+        row = connection.execute("SELECT shard_id, epoch FROM tile_owners WHERE tile_id = ?", (tile.tile_id,)).fetchone()
+    return row[0], row[1]
 
 
 class ShardRequestError(Exception):
@@ -215,7 +228,7 @@ async def get_state(request: Request):
 async def draw(request: DrawRequest, http_request: Request):
     token, user_id = session_for(http_request.cookies.get(SESSION_COOKIE))
     tile = tile_for_pixel(request.x, request.y)
-    shard_id = shard_for_tile(tile)
+    shard_id, epoch = ownership_for_tile(tile)
     color = request.color.upper()
     operation_id = request.operation_id or str(uuid.uuid4())
     key = f"{request.x},{request.y}"
@@ -231,7 +244,7 @@ async def draw(request: DrawRequest, http_request: Request):
                     "tile_id": tile.tile_id,
                     "color": color,
                     "owner": user_id,
-                    "epoch": 1,
+                    "epoch": epoch,
                     "operation_id": operation_id,
                 },
             )

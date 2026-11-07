@@ -18,6 +18,8 @@ def test_retry_after_later_write_does_not_rewind_state(tmp_path):
         snapshot = client.get("/tiles/tile-00-00/snapshot").json()
         assert snapshot["last_sequence"] == 2
         assert snapshot["pixels"][0]["color"] == "#0000FF"
+        operations = client.get("/tiles/tile-00-00/operations", params={"after": 1}).json()["operations"]
+        assert [(item["operation_id"], item["sequence"]) for item in operations] == [("op-2", 2)]
 
 
 def test_stale_epoch_and_reused_id_are_rejected(tmp_path):

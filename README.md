@@ -80,6 +80,14 @@ The coordinator reads `SHARD_URLS` at request time, so the new service can appea
 
 ## Tests
 
+On macOS or Linux, with Python 3.12 and Docker running, the full unit, Docker, and Chromium suite runs from one command:
+
+```sh
+./scripts/test-all.sh
+```
+
+The script installs test dependencies in `.venv`, starts a separate temporary Compose project, and removes its containers and volumes afterward. Port 8000 must be free; stop the normal canvas with `docker compose down` first. The first run downloads dependencies and Chromium.
+
 Install dependencies and run the unit suite from the repository root:
 
 ```powershell

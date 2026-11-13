@@ -7,6 +7,7 @@ import os
 import secrets
 import uuid
 import sqlite3
+import time
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -28,10 +29,19 @@ class ConnectionManager:
     async def broadcast(self, message: dict) -> None:
         for connection in self.active_connections.copy():
             try:
-                await connection.send_json(message)
+                await asyncio.wait_for(connection.send_json(message), timeout=2.0)
             except Exception:
                 logger.exception("WebSocket broadcast failed; dropping connection")
                 self.disconnect(connection)
+
+    async def resync_all(self) -> None:
+        """Force browsers to fetch an authoritative snapshot after an unknown commit."""
+        for connection in self.active_connections.copy():
+            self.disconnect(connection)
+            try:
+                await asyncio.wait_for(connection.close(code=1012, reason="Canvas resynchronizing"), timeout=2.0)
+            except Exception:
+                logger.exception("WebSocket resynchronization close failed")
 
 
 manager = ConnectionManager()
@@ -40,11 +50,12 @@ app = FastAPI(title="Collaborative Pixel Canvas")
 canvas_lock = asyncio.Lock()
 
 # Session tokens are issued by the server and never accepted from request bodies.
-# Session identity is process-local; shard SQLite files hold the pixel records.
+# The dictionary is a process-local cache; the durable mapping is in SQLite.
 sessions: dict[str, str] = {}
 # Coordinate -> {color, owner} cache, refreshed from the shard stores on reads.
 pixels: dict[str, dict[str, str]] = {}
 SESSION_COOKIE = "canvas_session"
+SESSION_TTL_SECONDS = 30 * 24 * 60 * 60
 DEFAULT_SHARD_URLS = (
     "shard-1=http://shard-1:8001,"
     "shard-2=http://shard-2:8002,"
@@ -157,12 +168,41 @@ class DrawRequest(BaseModel):
 
 def session_for(token: str | None) -> tuple[str, str]:
     """Return a known session token and user ID, issuing them when necessary."""
-    if token is not None and token in sessions:
-        return token, sessions[token]
-    new_token = secrets.token_urlsafe(32)
-    user_id = str(uuid.uuid4())
+    with ownership_db() as connection:
+        ensure_sessions_table(connection)
+        now = int(time.time())
+        connection.execute("DELETE FROM sessions WHERE expires_at <= ?", (now,))
+        if token is not None:
+            row = connection.execute("SELECT user_id FROM sessions WHERE token = ?", (token,)).fetchone()
+            if row is not None:
+                connection.execute("UPDATE sessions SET expires_at = ? WHERE token = ?",
+                                   (now + SESSION_TTL_SECONDS, token))
+                sessions[token] = row["user_id"]
+                return token, row["user_id"]
+        new_token = secrets.token_urlsafe(32)
+        user_id = str(uuid.uuid4())
+        connection.execute("INSERT INTO sessions VALUES (?, ?, ?)",
+                           (new_token, user_id, now + SESSION_TTL_SECONDS))
     sessions[new_token] = user_id
     return new_token, user_id
+
+
+def known_session(token: str | None) -> bool:
+    if token is None:
+        return False
+    with ownership_db() as connection:
+        ensure_sessions_table(connection)
+        return connection.execute("SELECT 1 FROM sessions WHERE token = ? AND expires_at > ?",
+                                  (token, int(time.time()))).fetchone() is not None
+
+
+def ensure_sessions_table(connection: sqlite3.Connection) -> None:
+    connection.execute("CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires_at INTEGER NOT NULL)")
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(sessions)")}
+    if "expires_at" not in columns:
+        connection.execute("ALTER TABLE sessions ADD COLUMN expires_at INTEGER")
+        connection.execute("UPDATE sessions SET expires_at = ? WHERE expires_at IS NULL",
+                           (int(time.time()) + SESSION_TTL_SECONDS,))
 
 
 def public_pixels() -> dict[str, str]:
@@ -291,7 +331,7 @@ async def transfer_endpoint(x: int, y: int, destination: str,
 def home(request: Request):
     token, _ = session_for(request.cookies.get(SESSION_COOKIE))
     response = FileResponse(Path(__file__).parent / "index.html")
-    response.set_cookie(SESSION_COOKIE, token, httponly=True, samesite="lax")
+    response.set_cookie(SESSION_COOKIE, token, httponly=True, samesite="lax", max_age=SESSION_TTL_SECONDS)
     return response
 
 
@@ -306,7 +346,7 @@ async def get_state(request: Request):
     except (ShardRequestError, ValueError) as exc:
         raise HTTPException(status_code=503, detail="canvas storage is unavailable") from exc
     response = JSONResponse({"pixels": state})
-    response.set_cookie(SESSION_COOKIE, token, httponly=True, samesite="lax")
+    response.set_cookie(SESSION_COOKIE, token, httponly=True, samesite="lax", max_age=SESSION_TTL_SECONDS)
     return response
 
 
@@ -356,7 +396,7 @@ async def draw(request: DrawRequest, http_request: Request):
         "tile_id": tile.tile_id, "shard_id": shard_id,
         "operation_id": operation_id, "epoch": committed.get("epoch", 1), "sequence": committed.get("sequence"),
     })
-    response.set_cookie(SESSION_COOKIE, token, httponly=True, samesite="lax")
+    response.set_cookie(SESSION_COOKIE, token, httponly=True, samesite="lax", max_age=SESSION_TTL_SECONDS)
     return response
 
 
@@ -379,34 +419,46 @@ async def clear_my_pixels(request: Request):
                 return_exceptions=True,
             )
             failure = next((result for result in results if isinstance(result, Exception)), None)
-            if failure is not None:
-                if isinstance(failure, ShardRequestError):
-                    raise failure
-                raise ShardRequestError("unknown", "could not clear every shard") from failure
             coordinates = [
                 [pixel["x"], pixel["y"]]
                 for result in results
+                if not isinstance(result, Exception)
                 for pixel in result["removed"]
             ]
             # A migrated tile can leave a fenced copy on its old shard. Only
             # broadcast removals absent from the authoritative owner now.
-            refreshed = await load_pixels_from_shards()
-            coordinates = [[x, y] for x, y in sorted({tuple(point) for point in coordinates})
-                           if f"{x},{y}" not in refreshed]
-            pixels.clear()
-            pixels.update(refreshed)
-            await manager.broadcast({"type": "clear", "pixels": coordinates})
+            try:
+                refreshed = await load_pixels_from_shards()
+            except (ShardRequestError, ValueError):
+                refreshed = None
+            if refreshed is not None:
+                coordinates = [[x, y] for x, y in sorted({tuple(point) for point in coordinates})
+                               if f"{x},{y}" not in refreshed]
+                pixels.clear()
+                pixels.update(refreshed)
+                if failure is None:
+                    await manager.broadcast({"type": "clear", "pixels": coordinates})
+                else:
+                    await manager.broadcast({"type": "state", "pixels": public_pixels()})
+            else:
+                await manager.broadcast({"type": "clear", "pixels": coordinates})
+                if failure is not None:
+                    await manager.resync_all()
+            if failure is not None:
+                return JSONResponse({"status": "partial", "cleared": len(coordinates),
+                                     "detail": "Some shards could not be cleared; refresh state before retrying"},
+                                    status_code=503)
     except ShardRequestError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     response = JSONResponse({"status": "ok", "cleared": len(coordinates)})
-    response.set_cookie(SESSION_COOKIE, token, httponly=True, samesite="lax")
+    response.set_cookie(SESSION_COOKIE, token, httponly=True, samesite="lax", max_age=SESSION_TTL_SECONDS)
     return response
 
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     token = websocket.cookies.get(SESSION_COOKIE)
-    if token is None or token not in sessions:
+    if not known_session(token):
         await websocket.close(code=1008, reason="Open the canvas to create a session")
         return
 
@@ -423,7 +475,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.close(code=1011, reason="Canvas storage is unavailable")
                 return
             manager.active_connections.append(websocket)
-            await websocket.send_json({"type": "state", "pixels": public_pixels()})
+            await asyncio.wait_for(websocket.send_json({"type": "state", "pixels": public_pixels()}), timeout=2.0)
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:

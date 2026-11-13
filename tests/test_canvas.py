@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 
 from fastapi.testclient import TestClient
 import pytest
@@ -10,7 +11,8 @@ from shared.tiles import configured_shard_ids, shard_for_tile, tile_for_pixel
 
 
 @pytest.fixture(autouse=True)
-def reset_memory_state(monkeypatch):
+def reset_memory_state(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "OWNERSHIP_DB_PATH", tmp_path / "ownership.sqlite3")
     main.pixels.clear()
     main.sessions.clear()
     main.manager.active_connections.clear()
@@ -314,3 +316,41 @@ def test_websocket_receives_state_and_committed_draw_update():
         assert socket.receive_json() == {
             "type": "draw", "x": 12, "y": 3, "color": "#ABCDEF"
         }
+def test_session_survives_coordinator_memory_reset_and_retains_clear_rights():
+    client = TestClient(main.app)
+    client.get("/")
+    token = client.cookies[main.SESSION_COOKIE]
+    owner = main.sessions[token]
+    client.post("/draw", json={"x": 4, "y": 5, "color": "#ff0000"})
+    main.sessions.clear()
+    assert main.session_for(token) == (token, owner)
+    assert client.delete("/clear").json() == {"status": "ok", "cleared": 1}
+
+
+def test_existing_session_table_is_migrated_without_losing_identity():
+    main.OWNERSHIP_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(main.OWNERSHIP_DB_PATH) as connection:
+        connection.execute("CREATE TABLE sessions (token TEXT PRIMARY KEY, user_id TEXT NOT NULL)")
+        connection.execute("INSERT INTO sessions VALUES ('old-token', 'old-owner')")
+    assert main.session_for("old-token") == ("old-token", "old-owner")
+    assert main.known_session("old-token")
+
+
+def test_partial_clear_reconciles_clients_and_reports_failure(monkeypatch):
+    client = TestClient(main.app)
+    client.get("/")
+    client.post("/draw", json={"x": 0, "y": 0, "color": "#ff0000"})
+    original = main.request_shard
+
+    async def fail_one_clear(shard_id, method, path, *, params=None, body=None):
+        if method == "DELETE" and shard_id == "shard-2":
+            raise main.ShardRequestError(shard_id, "simulated failure")
+        return await original(shard_id, method, path, params=params, body=body)
+
+    monkeypatch.setattr(main, "request_shard", fail_one_clear)
+    with client.websocket_connect("/ws") as socket:
+        assert socket.receive_json()["type"] == "state"
+        response = client.delete("/clear")
+        assert response.status_code == 503
+        assert response.json()["status"] == "partial"
+        assert socket.receive_json() == {"type": "state", "pixels": {}}

@@ -44,6 +44,7 @@
         <input id="color" type="color" value="#ff0000">
       </label>
       <button id="clear">Clear my pixels</button>
+      <label>Zoom <input id="zoom" type="range" min="1" max="8" value="1"></label>
     </div>
 
     <canvas id="canvas" width="1000" height="1000"></canvas>
@@ -54,28 +55,51 @@
     const ctx = canvas.getContext("2d");
     const colorInput = document.getElementById("color");
     const status = document.getElementById("status");
+    const clearButton = document.getElementById("clear");
+    const zoom = document.getElementById("zoom");
+    let ready = false;
+    let reconnectDelay = 500;
+    let socket;
+
+    function setReady(value) {
+      ready = value;
+      clearButton.disabled = !value;
+      canvas.style.cursor = value ? "crosshair" : "wait";
+    }
+    setReady(false);
+
+    function applyZoom() {
+      const size = Math.min(window.innerWidth * 0.8, 700) * Number(zoom.value);
+      canvas.style.width = `${size}px`;
+      canvas.style.height = `${size}px`;
+    }
+    zoom.addEventListener("input", applyZoom);
+    window.addEventListener("resize", applyZoom);
+    applyZoom();
 
     ctx.fillStyle = "#ffffff";
     ctx.fillRect(0, 0, 1000, 1000);
 
     function paint(x, y, color) {
       ctx.fillStyle = color;
-      // Enlarge each logical pixel for visibility.
-      ctx.fillRect(x, y, 3, 3);
+      ctx.fillRect(x, y, 1, 1);
     }
 
     const wsProtocol =
       window.location.protocol === "https:" ? "wss:" : "ws:";
 
-    const socket = new WebSocket(
-      `${wsProtocol}//${window.location.host}/ws`
-    );
-
-    socket.addEventListener("open", () => {
-      status.textContent = "Connected — live collaboration enabled";
-    });
-
-    socket.addEventListener("message", (event) => {
+    async function connect() {
+      setReady(false);
+      status.textContent = "Synchronizing canvas...";
+      try {
+        const response = await fetch("/state");
+        if (!response.ok) throw new Error("Canvas state unavailable");
+      } catch (error) {
+        scheduleReconnect();
+        return;
+      }
+      socket = new WebSocket(`${wsProtocol}//${window.location.host}/ws`);
+      socket.addEventListener("message", (event) => {
       const message = JSON.parse(event.data);
 
       if (message.type === "state") {
@@ -86,6 +110,9 @@
           const [x, y] = key.split(",").map(Number);
           paint(x, y, color);
         }
+        reconnectDelay = 500;
+        setReady(true);
+        status.textContent = "Connected — live collaboration enabled";
       }
 
       if (message.type === "draw") {
@@ -95,21 +122,28 @@
       if (message.type === "clear") {
         for (const [x, y] of message.pixels) {
           ctx.fillStyle = "#ffffff";
-          ctx.fillRect(x, y, 3, 3);
+          ctx.fillRect(x, y, 1, 1);
         }
       }
-    });
+      });
+      socket.addEventListener("close", () => {
+        setReady(false);
+        scheduleReconnect();
+      });
+      socket.addEventListener("error", () => socket.close());
+    }
 
-    socket.addEventListener("close", () => {
-      status.textContent = "Disconnected — refresh to reconnect";
-    });
-
-    socket.addEventListener("error", () => {
-      status.textContent = "WebSocket connection error";
-    });
+    function scheduleReconnect() {
+      setReady(false);
+      status.textContent = "Disconnected — reconnecting...";
+      setTimeout(connect, reconnectDelay);
+      reconnectDelay = Math.min(reconnectDelay * 2, 10000);
+    }
+    connect();
 
 
     canvas.addEventListener("pointerdown", async (event) => {
+      if (!ready) return;
       const rect = canvas.getBoundingClientRect();
       const x = Math.floor(
         (event.clientX - rect.left) / rect.width * 1000
@@ -119,6 +153,7 @@
       );
 
       const color = colorInput.value;
+      if (x < 0 || x >= 1000 || y < 0 || y >= 1000) return;
 
       try {
         const response = await fetch("/draw", {
@@ -129,7 +164,7 @@
 
         if (!response.ok) throw new Error("Drawing failed");
 
-        status.textContent = `Painted (${x}, ${y})`;
+        if (ready) status.textContent = `Painted (${x}, ${y})`;
       } catch (error) {
         status.textContent = "Error: " + error.message;
       }
@@ -137,15 +172,22 @@
 
     document.getElementById("clear").addEventListener(
       "click", async () => {
+        if (!ready) return;
+        try {
         const response = await fetch("/clear", { method: "DELETE" });
 
         if (!response.ok) {
-          status.textContent = "Could not clear canvas";
+          status.textContent = "Clear incomplete — reconnecting to refresh state";
+          socket.close();
           return;
         }
 
         const data = await response.json();
         status.textContent = `Cleared ${data.cleared} of your pixels`;
+        } catch (error) {
+          status.textContent = "Clear failed — reconnecting to refresh state";
+          socket.close();
+        }
       }
     );
   </script>

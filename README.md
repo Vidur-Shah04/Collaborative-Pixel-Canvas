@@ -97,6 +97,16 @@ Remove-Item Env:RUN_DOCKER_INTEGRATION
 
 The integration test checks actual Docker DNS health results and distinct mounted volume names. It creates two independent browser sessions, connects both to WebSockets, checks their shard-backed initial snapshots, routes a draw at `(25, 0)` to `tile-00-01` on shard-2, verifies the shard record and coordinator state, checks shard-1 rejects that tile, and confirms both sessions receive each other's draw updates. It restores any existing pixel records at its test coordinates and clears its session-owned writes. It also checks infrastructure-record isolation and persistence across `docker compose restart shard-1`.
 
+Browser tests use Playwright Chromium and restart the coordinator and shard-2. Run them only against a disposable Compose project, with port 8000 free:
+
+```sh
+python -m pip install playwright==1.65.1
+python -m playwright install chromium
+COMPOSE_PROJECT_NAME=canvasbrowser docker compose up --build -d
+COMPOSE_PROJECT_NAME=canvasbrowser RUN_BROWSER_INTEGRATION=1 python -m pytest -q tests/browser -p no:cacheprovider
+COMPOSE_PROJECT_NAME=canvasbrowser docker compose down
+```
+
 ## Local development without Docker
 
 ```powershell

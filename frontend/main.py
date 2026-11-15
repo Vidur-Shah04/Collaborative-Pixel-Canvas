@@ -1,6 +1,7 @@
 """Browser-facing coordinator for the collaborative pixel canvas."""
 
 from pathlib import Path
+from contextlib import asynccontextmanager, suppress
 import asyncio
 import logging
 import os
@@ -45,7 +46,20 @@ class ConnectionManager:
 
 
 manager = ConnectionManager()
-app = FastAPI(title="Collaborative Pixel Canvas")
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    recovery_task = asyncio.create_task(recover_pending_transfers())
+    try:
+        yield
+    finally:
+        recovery_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await recovery_task
+
+
+app = FastAPI(title="Collaborative Pixel Canvas", lifespan=lifespan)
 # Serializes state changes and their broadcasts with WebSocket state snapshots.
 canvas_lock = asyncio.Lock()
 
@@ -90,6 +104,40 @@ def ownership_db() -> sqlite3.Connection:
 def pending_transfer(tile_id: str) -> sqlite3.Row | None:
     with ownership_db() as connection:
         return connection.execute("SELECT * FROM transfers WHERE tile_id = ?", (tile_id,)).fetchone()
+
+
+def tile_from_id(tile_id: str) -> TileAddress:
+    try:
+        row, column = tile_id.removeprefix("tile-").split("-")
+        tile = tile_for_pixel(int(column) * 25, int(row) * 25)
+    except (ValueError, IndexError) as exc:
+        raise ValueError(f"invalid transfer tile ID: {tile_id}") from exc
+    if tile.tile_id != tile_id:
+        raise ValueError(f"invalid transfer tile ID: {tile_id}")
+    return tile
+
+
+async def recover_pending_transfers_once() -> int:
+    """Retry each durable transfer without blocking unrelated tiles."""
+    with ownership_db() as connection:
+        transfers = connection.execute("SELECT tile_id, destination FROM transfers ORDER BY tile_id").fetchall()
+    recovered = 0
+    for transfer in transfers:
+        try:
+            await transfer_tile(tile_from_id(transfer["tile_id"]), transfer["destination"])
+            recovered += 1
+        except Exception:
+            logger.exception("Tile transfer recovery pending for %s", transfer["tile_id"])
+    return recovered
+
+
+async def recover_pending_transfers() -> None:
+    while True:
+        try:
+            await recover_pending_transfers_once()
+        except Exception:
+            logger.exception("Could not scan pending tile transfers; retrying")
+        await asyncio.sleep(1)
 
 
 async def transfer_tile(tile: TileAddress, destination: str) -> dict:
@@ -324,7 +372,10 @@ async def transfer_endpoint(x: int, y: int, destination: str,
         tile = tile_for_pixel(x, y)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    return await transfer_tile(tile, destination)
+    try:
+        return await transfer_tile(tile, destination)
+    except ShardRequestError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 
 
 @app.get("/")

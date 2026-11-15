@@ -18,6 +18,7 @@ fi
 
 # A unique Compose project keeps these volumes separate from the normal canvas.
 export COMPOSE_PROJECT_NAME="canvascheck-$$"
+export ADMIN_TOKEN="canvascheck-transfer-token"
 trap 'docker compose down -v' EXIT
 docker compose up --build -d
 for attempt in {1..30}; do
@@ -27,5 +28,5 @@ for attempt in {1..30}; do
   sleep 1
 done
 .venv/bin/python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/state', timeout=2)"
-RUN_DOCKER_INTEGRATION=1 .venv/bin/python -m pytest -q tests/integration -p no:cacheprovider
+RUN_DOCKER_INTEGRATION=1 RUN_FAULT_INJECTION=1 .venv/bin/python -m pytest -q tests/integration -p no:cacheprovider
 RUN_BROWSER_INTEGRATION=1 .venv/bin/python -m pytest -q tests/browser -p no:cacheprovider

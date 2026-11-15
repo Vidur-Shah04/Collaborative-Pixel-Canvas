@@ -241,3 +241,40 @@ def test_compose_shards_use_isolated_volumes_and_keep_records_after_restart():
 
     restored = call_container_shard("shard-1", 8001, f"/records/{record_key}")
     assert restored["value"] == "survives-restart"
+
+
+@pytest.mark.skipif(os.getenv("RUN_FAULT_INJECTION") != "1", reason="requires disposable Compose data")
+def test_transfer_recovers_after_coordinator_restart_and_destination_outage():
+    """A fenced tile becomes writable on its new shard without a second admin call."""
+    tile_x, tile_y = 0, 25  # tile-01-00 starts on shard-2
+    token = os.environ["ADMIN_TOKEN"]
+    browser, _ = open_browser_session()
+    compose("stop", "shard-3")
+    try:
+        request = Request(
+            f"{COORDINATOR_URL}/admin/tiles/{tile_x}/{tile_y}/transfer?destination=shard-3",
+            data=b"", method="POST", headers={"X-Admin-Token": token},
+        )
+        with pytest.raises(HTTPError) as failed:
+            urlopen(request, timeout=10)
+        assert failed.value.code == 503
+        assert browser_json(browser, f"{COORDINATOR_URL}/draw", "POST",
+                            {"x": tile_x, "y": tile_y, "color": "#123456"})[0] == 503
+        compose("restart", "coordinator")
+    finally:
+        compose("start", "shard-3")
+
+    deadline = time.monotonic() + 40
+    while time.monotonic() < deadline:
+        try:
+            status, result = browser_json(browser, f"{COORDINATOR_URL}/draw", "POST",
+                                          {"x": tile_x, "y": tile_y, "color": "#123456"})
+            if status == 200:
+                assert result["shard_id"] == "shard-3"
+                assert result["epoch"] == 2
+                browser_json(browser, f"{COORDINATOR_URL}/clear", "DELETE")
+                return
+        except (URLError, TimeoutError, ConnectionError):
+            pass
+        time.sleep(1)
+    pytest.fail("coordinator did not automatically finish the pending transfer")

@@ -1,4 +1,5 @@
 import asyncio
+import threading
 
 import pytest
 from fastapi.testclient import TestClient
@@ -44,9 +45,9 @@ def test_fence_recovery_and_return_transfer(tmp_path, monkeypatch):
         with pytest.raises(coordinator.ShardRequestError):
             asyncio.run(coordinator.transfer_tile(tile, "shard-2"))
         assert coordinator.pending_transfer(tile.tile_id) is not None
-        result = asyncio.run(coordinator.transfer_tile(tile, "shard-2"))
-        assert result["epoch"] == 2
+        assert asyncio.run(coordinator.recover_pending_transfers_once()) == 1
         assert coordinator.pending_transfer(tile.tile_id) is None
+        assert coordinator.ownership_for_tile(tile) == ("shard-2", 2)
         assert asyncio.run(coordinator.transfer_tile(tile, "shard-2"))["epoch"] == 2
         assert destination.get(f"/tiles/{tile.tile_id}/snapshot").json()["pixels"][0]["color"] == "#FF0000"
         assert destination.get(f"/tiles/{tile.tile_id}/operations").json()["operations"][0]["operation_id"] == "first"
@@ -57,3 +58,47 @@ def test_fence_recovery_and_return_transfer(tmp_path, monkeypatch):
         assert back["epoch"] == 3
         assert source.get(f"/tiles/{tile.tile_id}/snapshot").json()["last_sequence"] == 2
         assert [op["operation_id"] for op in source.get(f"/tiles/{tile.tile_id}/operations").json()["operations"]] == ["first", "second"]
+
+
+def test_coordinator_starts_transfer_recovery_task(tmp_path, monkeypatch):
+    monkeypatch.setattr(coordinator, "OWNERSHIP_DB_PATH", tmp_path / "ownership.sqlite3")
+    called = threading.Event()
+
+    async def recover_once():
+        called.set()
+        return 0
+
+    monkeypatch.setattr(coordinator, "recover_pending_transfers_once", recover_once)
+    with TestClient(coordinator.app):
+        assert called.wait(timeout=2)
+
+
+def test_pending_transfer_stays_fenced_until_destination_recovers(tmp_path, monkeypatch):
+    monkeypatch.setattr(coordinator, "OWNERSHIP_DB_PATH", tmp_path / "ownership.sqlite3")
+    source = TestClient(create_app("shard-1", 8001, tmp_path / "one.sqlite3"))
+    destination = TestClient(create_app("shard-2", 8002, tmp_path / "two.sqlite3"))
+    tile = tile_for_pixel(0, 0)
+    unavailable = True
+
+    async def request(shard_id, method, path, *, params=None, body=None):
+        if shard_id == "shard-2" and unavailable:
+            raise coordinator.ShardRequestError(shard_id, "destination down")
+        client = {"shard-1": source, "shard-2": destination}[shard_id]
+        response = client.request(method, path, params=params, json=body)
+        if response.status_code >= 400:
+            raise coordinator.ShardRequestError(shard_id, response.text, response.status_code)
+        return response.json()
+
+    monkeypatch.setattr(coordinator, "request_shard", request)
+    with source, destination:
+        with pytest.raises(coordinator.ShardRequestError):
+            asyncio.run(coordinator.transfer_tile(tile, "shard-2"))
+        assert asyncio.run(coordinator.recover_pending_transfers_once()) == 0
+        assert coordinator.pending_transfer(tile.tile_id) is not None
+        assert source.post("/pixels", json={"x": 0, "y": 0, "tile_id": tile.tile_id,
+                                            "color": "#ff0000", "owner": "alice", "epoch": 1,
+                                            "operation_id": "late"}).status_code == 409
+        unavailable = False
+        assert asyncio.run(coordinator.recover_pending_transfers_once()) == 1
+        assert coordinator.ownership_for_tile(tile) == ("shard-2", 2)
+        assert coordinator.pending_transfer(tile.tile_id) is None

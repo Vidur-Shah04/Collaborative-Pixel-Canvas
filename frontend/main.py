@@ -62,6 +62,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="Collaborative Pixel Canvas", lifespan=lifespan)
 # Serializes state changes and their broadcasts with WebSocket state snapshots.
 canvas_lock = asyncio.Lock()
+tile_transfer_locks: dict[str, asyncio.Lock] = {}
 
 # Session tokens are issued by the server and never accepted from request bodies.
 # The dictionary is a process-local cache; the durable mapping is in SQLite.
@@ -140,61 +141,116 @@ async def recover_pending_transfers() -> None:
         await asyncio.sleep(1)
 
 
+async def copy_tile_operations(source: str, destination: str, tile_id: str,
+                               next_epoch: int, after: int, *, until: int | None = None,
+                               max_pages: int | None = None) -> int:
+    """Stream bounded log pages; return the last copied sequence."""
+    pages = 0
+    while until is None or after < until:
+        page = await request_shard(source, "GET", f"/tiles/{tile_id}/operations",
+                                   params={"after": after, "limit": 100})
+        operations = [operation for operation in page["operations"]
+                      if until is None or operation["sequence"] <= until]
+        if not operations:
+            break
+        if any(operation["sequence"] != after + index + 1
+               for index, operation in enumerate(operations)):
+            raise ShardRequestError(source, "source operation log has a gap", 502)
+        receipt = await request_shard(destination, "POST", f"/tiles/{tile_id}/import-operations",
+                                      body={"epoch": next_epoch, "operations": operations})
+        after = operations[-1]["sequence"]
+        if receipt.get("last_sequence", 0) < after:
+            raise ShardRequestError(destination, "destination did not import operations", 502)
+        pages += 1
+        if max_pages is not None and pages >= max_pages:
+            break
+    if until is not None and after < until:
+        raise ShardRequestError(source, "source operation log ended before snapshot", 502)
+    return after
+
+
 async def transfer_tile(tile: TileAddress, destination: str) -> dict:
-    """Resume a fenced single-tile transfer until its new owner is active."""
-    async with canvas_lock:
-        if destination not in configured_shard_ids():
-            raise HTTPException(status_code=422, detail="unknown destination shard")
-        owner, epoch = ownership_for_tile(tile)
-        with ownership_db() as connection:
-            transfer = connection.execute("SELECT * FROM transfers WHERE tile_id = ?", (tile.tile_id,)).fetchone()
-            if transfer is None:
-                if destination == owner:
-                    return {"tile_id": tile.tile_id, "owner": owner, "epoch": epoch}
-                connection.execute("INSERT INTO transfers VALUES (?, ?, ?, ?, 'preparing')",
-                                   (tile.tile_id, owner, destination, epoch))
-                source, old_epoch = owner, epoch
-            else:
-                if transfer["destination"] != destination:
-                    raise HTTPException(status_code=409, detail="different transfer pending")
-                source, old_epoch = transfer["source"], transfer["old_epoch"]
-        # Source fence commits before any destination activation. Repeatable after
-        # a crash; the source's snapshot is stable once fenced.
-        await request_shard(source, "POST", f"/tiles/{tile.tile_id}/fence", params={"epoch": old_epoch})
-        with ownership_db() as connection:
-            connection.execute("UPDATE transfers SET phase = 'fenced' WHERE tile_id = ?", (tile.tile_id,))
-        snapshot = await request_shard(source, "GET", f"/tiles/{tile.tile_id}/snapshot")
-        operations = []
-        after = 0
-        while True:
-            page = await request_shard(source, "GET", f"/tiles/{tile.tile_id}/operations",
-                                       params={"after": after, "limit": 1000})
-            batch = page["operations"]
-            operations.extend(batch)
-            if not batch:
-                break
-            after = batch[-1]["sequence"]
-        try:
-            destination_snapshot = await request_shard(destination, "GET", f"/tiles/{tile.tile_id}/snapshot")
-        except ShardRequestError as exc:
-            if exc.status_code != 404:
-                raise
-            destination_snapshot = None
-        if not destination_snapshot or not destination_snapshot["active"]:
-            await request_shard(destination, "POST", f"/tiles/{tile.tile_id}/install",
-                                body={"epoch": old_epoch + 1, "last_sequence": snapshot["last_sequence"],
-                                      "pixels": snapshot["pixels"], "operations": operations})
-        elif (destination_snapshot["epoch"] != old_epoch + 1 or
-              destination_snapshot["last_sequence"] < snapshot["last_sequence"]):
-            raise HTTPException(status_code=409, detail="destination state does not match transfer")
-        with ownership_db() as connection:
-            connection.execute("UPDATE transfers SET phase = 'installed' WHERE tile_id = ?", (tile.tile_id,))
-        await request_shard(destination, "POST", f"/tiles/{tile.tile_id}/activate", params={"epoch": old_epoch + 1})
-        with ownership_db() as connection:
-            connection.execute("UPDATE tile_owners SET shard_id = ?, epoch = ? WHERE tile_id = ?",
-                               (destination, old_epoch + 1, tile.tile_id))
-            connection.execute("DELETE FROM transfers WHERE tile_id = ?", (tile.tile_id,))
-        return {"tile_id": tile.tile_id, "owner": destination, "epoch": old_epoch + 1}
+    """Copy while writes continue, then fence briefly and cut over."""
+    async with tile_transfer_locks.setdefault(tile.tile_id, asyncio.Lock()):
+        async with canvas_lock:
+            if destination not in configured_shard_ids():
+                raise HTTPException(status_code=422, detail="unknown destination shard")
+            owner, epoch = ownership_for_tile(tile)
+            with ownership_db() as connection:
+                transfer = connection.execute("SELECT * FROM transfers WHERE tile_id = ?", (tile.tile_id,)).fetchone()
+                if transfer is None:
+                    if destination == owner:
+                        return {"tile_id": tile.tile_id, "owner": owner, "epoch": epoch}
+                    connection.execute("INSERT INTO transfers VALUES (?, ?, ?, ?, 'preparing')",
+                                       (tile.tile_id, owner, destination, epoch))
+                    source, old_epoch, phase = owner, epoch, "preparing"
+                else:
+                    if transfer["destination"] != destination:
+                        raise HTTPException(status_code=409, detail="different transfer pending")
+                    source, old_epoch, phase = transfer["source"], transfer["old_epoch"], transfer["phase"]
+
+        tile_path = f"/tiles/{tile.tile_id}"
+        next_epoch = old_epoch + 1
+        if phase == "preparing":
+            snapshot = await request_shard(source, "GET", f"{tile_path}/snapshot")
+            if snapshot["epoch"] != old_epoch:
+                raise ShardRequestError(source, "source epoch changed during copy", 409)
+            await request_shard(destination, "POST", f"{tile_path}/install",
+                                body={"epoch": next_epoch, "last_sequence": snapshot["last_sequence"],
+                                      "pixels": snapshot["pixels"], "operations": []})
+            await copy_tile_operations(source, destination, tile.tile_id, next_epoch, 0,
+                                       until=snapshot["last_sequence"])
+            await copy_tile_operations(source, destination, tile.tile_id, next_epoch,
+                                       snapshot["last_sequence"], max_pages=5)
+            # All earlier draws finish before this phase change. New draws for
+            # this tile pause, but unrelated tiles keep working.
+            async with canvas_lock:
+                with ownership_db() as connection:
+                    connection.execute("UPDATE transfers SET phase = 'fencing' WHERE tile_id = ?",
+                                       (tile.tile_id,))
+            phase = "fencing"
+
+        if phase == "fencing":
+            await request_shard(source, "POST", f"{tile_path}/fence", params={"epoch": old_epoch})
+            with ownership_db() as connection:
+                connection.execute("UPDATE transfers SET phase = 'fenced' WHERE tile_id = ?",
+                                   (tile.tile_id,))
+            phase = "fenced"
+
+        if phase == "fenced":
+            source_snapshot = await request_shard(source, "GET", f"{tile_path}/snapshot")
+            if source_snapshot["epoch"] != old_epoch or source_snapshot["active"]:
+                raise ShardRequestError(source, "source fence is not durable", 409)
+            try:
+                destination_snapshot = await request_shard(destination, "GET", f"{tile_path}/snapshot")
+            except ShardRequestError as exc:
+                if exc.status_code != 404:
+                    raise
+                # A transfer created by the previous fenced protocol may not
+                # have installed its destination before the coordinator died.
+                await request_shard(destination, "POST", f"{tile_path}/install",
+                                    body={"epoch": next_epoch,
+                                          "last_sequence": source_snapshot["last_sequence"],
+                                          "pixels": source_snapshot["pixels"], "operations": []})
+                await copy_tile_operations(source, destination, tile.tile_id, next_epoch, 0,
+                                           until=source_snapshot["last_sequence"])
+                destination_snapshot = await request_shard(destination, "GET", f"{tile_path}/snapshot")
+            if destination_snapshot["epoch"] != next_epoch:
+                raise ShardRequestError(destination, "destination epoch mismatch", 409)
+            await copy_tile_operations(source, destination, tile.tile_id, next_epoch,
+                                       destination_snapshot["last_sequence"],
+                                       until=source_snapshot["last_sequence"])
+            with ownership_db() as connection:
+                connection.execute("UPDATE transfers SET phase = 'installed' WHERE tile_id = ?",
+                                   (tile.tile_id,))
+
+        await request_shard(destination, "POST", f"{tile_path}/activate", params={"epoch": next_epoch})
+        async with canvas_lock:
+            with ownership_db() as connection:
+                connection.execute("UPDATE tile_owners SET shard_id = ?, epoch = ? WHERE tile_id = ?",
+                                   (destination, next_epoch, tile.tile_id))
+                connection.execute("DELETE FROM transfers WHERE tile_id = ?", (tile.tile_id,))
+        return {"tile_id": tile.tile_id, "owner": destination, "epoch": next_epoch}
 
 
 class ShardRequestError(Exception):
@@ -410,7 +466,8 @@ async def draw(request: DrawRequest, http_request: Request):
     key = f"{request.x},{request.y}"
     try:
         async with canvas_lock:
-            if pending_transfer(tile.tile_id):
+            transfer = pending_transfer(tile.tile_id)
+            if transfer is not None and transfer["phase"] != "preparing":
                 raise HTTPException(status_code=503, detail="tile transfer pending; retry later")
             shard_id, epoch = ownership_for_tile(tile)
             committed = await request_shard(

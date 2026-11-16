@@ -258,8 +258,9 @@ def test_transfer_recovers_after_coordinator_restart_and_destination_outage():
         with pytest.raises(HTTPError) as failed:
             urlopen(request, timeout=10)
         assert failed.value.code == 503
+        # Copy has not fenced the source yet, so this write must still work.
         assert browser_json(browser, f"{COORDINATOR_URL}/draw", "POST",
-                            {"x": tile_x, "y": tile_y, "color": "#123456"})[0] == 503
+                            {"x": tile_x, "y": tile_y, "color": "#123456"})[0] == 200
         compose("restart", "coordinator")
     finally:
         compose("start", "shard-3")
@@ -269,8 +270,7 @@ def test_transfer_recovers_after_coordinator_restart_and_destination_outage():
         try:
             status, result = browser_json(browser, f"{COORDINATOR_URL}/draw", "POST",
                                           {"x": tile_x, "y": tile_y, "color": "#123456"})
-            if status == 200:
-                assert result["shard_id"] == "shard-3"
+            if status == 200 and result["shard_id"] == "shard-3":
                 assert result["epoch"] == 2
                 browser_json(browser, f"{COORDINATOR_URL}/clear", "DELETE")
                 return
@@ -278,3 +278,36 @@ def test_transfer_recovers_after_coordinator_restart_and_destination_outage():
             pass
         time.sleep(1)
     pytest.fail("coordinator did not automatically finish the pending transfer")
+
+
+@pytest.mark.skipif(os.getenv("RUN_FAULT_INJECTION") != "1", reason="requires disposable Compose data")
+def test_transfer_recovers_when_source_returns():
+    """A source outage during copy leaves a retryable transfer record."""
+    tile_x, tile_y = 50, 0  # tile-00-02 starts on shard-3
+    token = os.environ["ADMIN_TOKEN"]
+    compose("stop", "shard-3")
+    try:
+        request = Request(
+            f"{COORDINATOR_URL}/admin/tiles/{tile_x}/{tile_y}/transfer?destination=shard-1",
+            data=b"", method="POST", headers={"X-Admin-Token": token},
+        )
+        with pytest.raises(HTTPError) as failed:
+            urlopen(request, timeout=10)
+        assert failed.value.code == 503
+    finally:
+        compose("start", "shard-3")
+
+    browser, _ = open_browser_session()
+    deadline = time.monotonic() + 40
+    while time.monotonic() < deadline:
+        try:
+            status, result = browser_json(browser, f"{COORDINATOR_URL}/draw", "POST",
+                                          {"x": tile_x, "y": tile_y, "color": "#654321"})
+            if status == 200 and result["shard_id"] == "shard-1":
+                assert result["epoch"] == 2
+                browser_json(browser, f"{COORDINATOR_URL}/clear", "DELETE")
+                return
+        except (URLError, TimeoutError, ConnectionError):
+            pass
+        time.sleep(1)
+    pytest.fail("coordinator did not recover after the source returned")

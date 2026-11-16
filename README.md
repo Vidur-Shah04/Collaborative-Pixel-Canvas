@@ -4,7 +4,7 @@ A FastAPI collaborative canvas with a Docker Compose coordinator and three shard
 
 For the current system diagram and consistency boundaries, see [ARCHITECTURE.md](ARCHITECTURE.md). For the student-oriented file/function walkthrough and reproducible demonstrations, see [FOLLOW_ALONG.md](FOLLOW_ALONG.md).
 
-Tile routing and shard pixel storage are implemented in Stage 3A. Session mappings and active WebSockets remain coordinator-local. Ownership epochs, operation IDs/deduplication, cross-shard atomic Clear, live migration, and crash recovery are not implemented. The opt-in Docker integration test exercises two real browser sessions, shard routing/storage, state refresh, shard-side rejection, and WebSocket snapshots/updates; run it against a live Compose project to verify the current Docker environment.
+The coordinator stores sessions and tile ownership in SQLite; each shard stores its pixels and ordered draw log in its own SQLite volume. Tile transfers copy pixels and log pages while drawing continues, then briefly pause that tile for a fenced cutover. Interrupted transfers resume automatically. Clear is still best-effort across shards rather than atomic. The isolated `./scripts/test-all.sh` command runs unit, real-container, and browser tests.
 
 ## Requirements
 

@@ -31,3 +31,23 @@ def test_stale_epoch_and_reused_id_are_rejected(tmp_path):
         assert client.post("/pixels", json=write).status_code == 201
         assert client.post("/pixels", json={**write, "color": "#0000ff"}).status_code == 409
         assert client.get("/tiles/tile-00-00/snapshot").json()["last_sequence"] == 1
+
+
+def test_import_rejects_gap_without_changing_prepared_snapshot(tmp_path):
+    app = create_app("shard-2", 8002, tmp_path / "shard.sqlite3")
+    with TestClient(app) as client:
+        tile = "tile-00-00"
+        assert client.post(f"/tiles/{tile}/install", json={
+            "epoch": 2, "last_sequence": 1,
+            "pixels": [{"x": 0, "y": 0, "color": "#FF0000", "owner": "alice"}],
+            "operations": [],
+        }).status_code == 200
+        operation = {"operation_id": "gap", "epoch": 1, "sequence": 3,
+                     "payload": [0, 0, tile, "#0000FF", "alice"],
+                     "result": {"sequence": 3}}
+        assert client.post(f"/tiles/{tile}/import-operations", json={
+            "epoch": 2, "operations": [operation],
+        }).status_code == 409
+        snapshot = client.get(f"/tiles/{tile}/snapshot").json()
+        assert snapshot["last_sequence"] == 1
+        assert snapshot["pixels"][0]["color"] == "#FF0000"

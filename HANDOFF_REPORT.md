@@ -8,18 +8,17 @@ The browser sends a pixel draw to the coordinator. The coordinator finds which 2
 
 ## Work completed since the earlier progress review
 
-| Problem | How we handled it |
-| --- | --- |
-| Neighbouring pixels visually covered each other | The browser now draws exactly one logical pixel per stored pixel. Zoom changes the display size and keeps click coordinates aligned. |
-| A coordinator restart lost who owned pixels | Session tokens and user IDs now live in SQLite. Existing session tables are upgraded in place. |
-| A failed Clear could leave browsers showing old pixels | Clear reports a partial result, refreshes from shard storage when possible, and makes browsers reconnect when a reliable refresh is unavailable. Clear is still not atomic across shards. |
-| A dropped connection left the page stale | The browser reconnects with a delay, gets a fresh snapshot, and disables drawing and Clear until ready. Slow WebSocket sends have a time limit. |
-| Tests and CI needed a repeatable setup | `./scripts/test-all.sh` installs test tools, runs unit tests, starts a separate temporary Compose project, runs Docker and Chromium tests, then removes that project's test containers and volumes. GitHub Actions runs the same script on pushes. |
-| Retried draws might apply twice | Each draw has an operation ID. A shard stores the operation and pixel together and returns the original result on a matching retry. Each tile has an ordered sequence number and ownership epoch. |
-| An interrupted tile transfer needed manual help | The coordinator records transfer progress in SQLite and retries it after restart or a shard outage. |
-| Moving a tile stopped drawing for the whole copy | The coordinator now copies a tile snapshot and pages of draw history while the old shard keeps accepting draws. It catches up later writes, briefly pauses that tile, fences the old shard, copies final writes, and activates the new owner. |
+1. **Made the canvas behave properly.** Two neighbouring colours used to cover each other on screen. We changed drawing to show one stored pixel as one canvas pixel and added zoom that keeps clicks aligned. If the connection drops, the page now reconnects and reloads the canvas before accepting another draw. The “Clear my pixels” button now reports when only some shards could be cleared and refreshes the page's view of the saved data.
 
-Failure tests cover lost responses during snapshot, log copy, import, fencing, and activation; source and destination shard outages; and coordinator restart. They check that acknowledged writes survive and the old owner cannot keep writing after handoff.
+2. **Made ownership survive a restart.** The app used to forget which pixels belonged to a browser when the main server restarted. It now saves the browser's session and tile ownership in SQLite. Existing session databases are upgraded without deleting their users.
+
+3. **Made draw retries safe.** The coordinator gives every draw an ID, and a caller can reuse that ID when retrying a request whose reply was lost. The shard saves the ID with the pixel and returns the first result for a matching retry. It also numbers draws within each tile, so the transfer process knows their order.
+
+4. **Made interrupted transfers resume.** If a server stopped halfway through moving a tile, the coordinator used to need another manual request. It now saves the transfer step and retries automatically when the coordinator or shard comes back.
+
+5. **Kept drawing available during most of a transfer.** The old approach stopped drawing before copying a tile. Now the old shard keeps taking draws while the new shard receives the saved pixels and draw history. The coordinator copies any newer draws, pauses that tile briefly, blocks the old shard from writing, then switches ownership. Other tiles keep working throughout.
+
+6. **Put testing on one command.** `./scripts/test-all.sh` runs the code tests, real Docker tests, and browser tests using a separate temporary canvas. GitHub Actions runs that same command after a push. The failure tests deliberately stop source and destination shards, restart the coordinator, and lose replies at several transfer steps. They check that saved draws arrive at the new owner and the old owner cannot accept new writes after the switch.
 
 ## Verified state
 

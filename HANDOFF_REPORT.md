@@ -10,15 +10,27 @@ The browser sends a pixel draw to the coordinator. The coordinator finds which 2
 
 1. **Made the canvas behave properly.** Two neighbouring colours used to cover each other on screen. We changed drawing to show one stored pixel as one canvas pixel and added zoom that keeps clicks aligned. If the connection drops, the page now reconnects and reloads the canvas before accepting another draw. The “Clear my pixels” button now reports when only some shards could be cleared and refreshes the page's view of the saved data.
 
+   **Distributed concepts:** client synchronization (getting the browser back in line with saved state) and partial failure (one shard can fail while others succeed).
+
 2. **Made ownership survive a restart.** The app used to forget which pixels belonged to a browser when the main server restarted. It now saves the browser's session and tile ownership in SQLite. Existing session databases are upgraded without deleting their users.
+
+   **Distributed concepts:** durable state (important facts survive a process restart) and an ownership registry (the saved record of which shard owns each tile).
 
 3. **Made draw retries safe.** The coordinator gives every draw an ID, and a caller can reuse that ID when retrying a request whose reply was lost. The shard saves the ID with the pixel and returns the first result for a matching retry. It also numbers draws within each tile, so the transfer process knows their order.
 
+   **Distributed concepts:** idempotency (repeating one request does not apply it twice), per-tile ordering, and epochs (version numbers that reject writes sent to an old tile owner).
+
 4. **Made interrupted transfers resume.** If a server stopped halfway through moving a tile, the coordinator used to need another manual request. It now saves the transfer step and retries automatically when the coordinator or shard comes back.
+
+   **Distributed concepts:** a durable state machine (saved transfer steps) and crash recovery through safe retries.
 
 5. **Kept drawing available during most of a transfer.** The old approach stopped drawing before copying a tile. Now the old shard keeps taking draws while the new shard receives the saved pixels and draw history. The coordinator copies any newer draws, pauses that tile briefly, blocks the old shard from writing, then switches ownership. Other tiles keep working throughout.
 
+   **Distributed concepts:** live migration, snapshot plus log catch-up (copying changes made after the snapshot), and fencing (stopping the old owner before the new one takes over).
+
 6. **Put testing on one command.** `./scripts/test-all.sh` runs the code tests, real Docker tests, and browser tests using a separate temporary canvas. GitHub Actions runs that same command after a push. The failure tests deliberately stop source and destination shards, restart the coordinator, and lose replies at several transfer steps. They check that saved draws arrive at the new owner and the old owner cannot accept new writes after the switch.
+
+   **Distributed concepts:** fault injection (deliberately causing outages) and end-to-end checks across the coordinator, shards, storage, and browser.
 
 ## Verified state
 

@@ -83,6 +83,99 @@ def test_reconnect_restores_authoritative_canvas(page):
         page.locator("#clear:enabled").click(timeout=30000)
 
 
+def test_offline_browser_resynchronizes_after_missed_clear_and_draw(page):
+    draw(page, 25, 2, "#00ff00")
+    page.wait_for_function("""() => {
+        const data = document.querySelector('canvas').getContext('2d').getImageData(25, 2, 1, 1).data;
+        return data[1] === 255 && data[0] === 0;
+    }""")
+    network = page.context.new_cdp_session(page)
+    network.send("Network.enable")
+    network.send("Network.emulateNetworkConditions", {
+        "offline": True, "latency": 0, "downloadThroughput": 0, "uploadThroughput": 0,
+    })
+    peer = page.context.new_page()
+    peer.goto("http://localhost:8000/")
+    peer.get_by_text("Connected — live collaboration enabled").wait_for(timeout=20000)
+    peer.locator("#clear").click()
+    peer.wait_for_function("""() => {
+        const data = document.querySelector('canvas').getContext('2d').getImageData(25, 2, 1, 1).data;
+        return data[0] === 255 && data[1] === 255 && data[2] === 255;
+    }""")
+    draw(peer, 26, 2, "#0000ff")
+    network.send("Network.emulateNetworkConditions", {
+        "offline": False, "latency": 0, "downloadThroughput": -1, "uploadThroughput": -1,
+    })
+    page.get_by_text("Connected — live collaboration enabled").wait_for(timeout=30000)
+    assert color_at(page, 25, 2) == [255, 255, 255]
+    assert color_at(page, 26, 2) == [0, 0, 255]
+    peer.close()
+    network.detach()
+
+
+def test_duplicate_clear_event_does_not_erase_a_later_draw(page):
+    page.add_init_script("""(() => {
+        const add = WebSocket.prototype.addEventListener;
+        WebSocket.prototype.addEventListener = function(type, listener, options) {
+            if (type !== 'message') return add.call(this, type, listener, options);
+            const socket = this;
+            return add.call(this, type, (event) => {
+                listener.call(socket, event);
+                try {
+                    if (JSON.parse(event.data).type === 'clear') {
+                        setTimeout(() => listener.call(socket, event), 500);
+                    }
+                } catch (_) {}
+            }, options);
+        };
+    })();""")
+    page.reload()
+    page.get_by_text("Connected — live collaboration enabled").wait_for(timeout=20000)
+    draw(page, 27, 3, "#ff0000")
+    page.locator("#clear").click()
+    page.wait_for_function("""() => {
+        const d = document.querySelector('canvas').getContext('2d').getImageData(27, 3, 1, 1).data;
+        return d[0] === 255 && d[1] === 255 && d[2] === 255;
+    }""")
+    draw(page, 27, 3, "#0000ff")
+    page.wait_for_function("""() => {
+        const d = document.querySelector('canvas').getContext('2d').getImageData(27, 3, 1, 1).data;
+        return d[0] === 0 && d[1] === 0 && d[2] === 255;
+    }""")
+    page.wait_for_timeout(700)
+    assert color_at(page, 27, 3) == [0, 0, 255]
+
+
+def test_sequence_gap_forces_snapshot_resynchronization(page):
+    page.add_init_script("""(() => {
+        const add = WebSocket.prototype.addEventListener;
+        let dropped = false;
+        WebSocket.prototype.addEventListener = function(type, listener, options) {
+            if (type !== 'message') return add.call(this, type, listener, options);
+            const socket = this;
+            return add.call(this, type, (event) => {
+                try {
+                    const message = JSON.parse(event.data);
+                    if (!dropped && message.type === 'draw') { dropped = true; return; }
+                } catch (_) {}
+                listener.call(socket, event);
+            }, options);
+        };
+    })();""")
+    page.reload()
+    page.get_by_text("Connected — live collaboration enabled").wait_for(timeout=20000)
+    draw(page, 28, 4, "#ff0000")
+    draw(page, 29, 4, "#0000ff")
+    page.wait_for_function("""() => {
+        const c = document.querySelector('canvas').getContext('2d');
+        const red = c.getImageData(28, 4, 1, 1).data;
+        const blue = c.getImageData(29, 4, 1, 1).data;
+        return red[0] === 255 && red[1] === 0 && blue[2] === 255 && blue[0] === 0;
+    }""", timeout=30000)
+    assert color_at(page, 28, 4) == [255, 0, 0]
+    assert color_at(page, 29, 4) == [0, 0, 255]
+
+
 def test_partial_clear_reports_error_and_recovers(page):
     draw(page, 0, 0, "#ff0000")
     try:

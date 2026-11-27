@@ -13,13 +13,111 @@ The project currently demonstrates several useful distributed-systems building b
 - **Service separation:** Docker Compose describes a coordinator and three independently configured shard services, connected by a bridge network and DNS names.
 - **Deterministic tile routing:** a shared routing module maps each pixel to a row-major tile and assigns each tile to one configured shard without Python's randomized `hash()`.
 - **Shard-owned pixel records:** the coordinator sends each draw to its selected shard. That shard verifies tile ownership and writes the pixel's colour and session owner into SQLite.
+- **Recoverable, ordered Clear:** a UUID operation ID and durable prepare/commit/finalize records let the coordinator resume interrupted cross-shard Clear after restart. Once every participant commits deletion, shards add Clear events to affected tiles' ordered operation logs.
+- **Browser resynchronization:** live draw/Clear events carry durable per-tile sequence positions. The browser ignores duplicates and reconnects for an authoritative snapshot if it sees a sequence gap.
+- **Snapshot replay and verification:** shards can store a durable per-tile checkpoint, restore it, and replay later draw, Clear, and Undo log entries. `/hash` computes a canonical SHA-256 over visible canvas colors.
+- **User-aware undo:** each session can attempt to undo its latest draw up to ten times. Undo only restores the prior pixel if that session still owns the current value; another user's overwrite is preserved.
 - **Storage isolation:** each shard service has a distinct SQLite file in its own named Docker volume. The same DB also contains sample infrastructure records.
 
-The browser talks to the coordinator only. It accepts drawing/Clear HTTP requests, routes pixels to shards, and sends WebSocket updates only after the assigned shard confirms a write. It also reads pixel state from all assigned shards. Session mappings and a coordinator pixel cache remain in memory. Docker source/configuration exists, but live container verification must be established on a machine with Docker.
+The browser talks to the coordinator only. It accepts draw, Undo, and Clear HTTP requests, routes tile operations to shards, and sends WebSocket updates only after the assigned shard confirms them. Clear uses durable coordinator and shard prepare/commit/finalize records. Session mappings and a coordinator pixel cache are held in process memory, while session identity, ownership, per-session undo attempts, and draw action order are stored in coordinator SQLite. Docker source/configuration exists, but live container verification must be established on a machine with Docker.
 
 Docker containers simulate distinct processes and service identities on one physical computer. A Compose network gives each service a DNS name, and named volumes keep each shard database across container restarts. This is a useful local distributed-systems lab, but it is not a simulation of separate physical computers or networks with independent failures.
 
 ## B. Prerequisites and setup
+
+### Recoverable cross-shard Clear (Priority 1)
+
+The Clear button sends a browser-generated UUID in `X-Operation-ID` and retains it while the page remains open if the request fails, so another click retries the same operation. Coordinator SQLite records the user, participants, phase, coordinates, and history-finalization status. Each shard's `clear_operations` table records its prepared coordinate set and commit/finalize phase in the same SQLite database as its pixels. After all pixel commits, each shard writes one Clear event per affected tile into `pixel_operations` at that tile's next sequence. The coordinator marks Clear complete only after every shard finalizes its history event. A shard process restart with its named volume intact retains both records; deleting the volume or losing its database is not recoverable. A failure may temporarily leave participants at different phases, but draws and migration wait while recovery retries. This remains recoverable, not atomic.
+
+Tile Clear events carry the Clear operation ID and initiating session ID. They use the existing per-tile sequence, so a draw before Clear has a lower sequence and a draw after Clear has a higher sequence on that tile. The coordinator's pending phase is the global completion marker: migration's snapshot/import replay path is blocked until all participants have finalized. A no-op Clear has no tile event, but its completed coordinator record remains durable.
+
+Completed Clears from before ordered Clear history was added remain in the coordinator's legacy records, but their exact position relative to older draws cannot be reconstructed; migration marks them complete without fabricating a tile sequence.
+
+### Browser disconnect and resynchronization (Priority 2)
+
+The WebSocket's first `state` message contains the complete current pixel map and a `positions` map keyed by tile ID. A position contains the tile ownership `epoch` and last committed `sequence`. Draw messages carry one tile position; Clear messages carry one position per affected tile. The page applies only the next sequence for each tile, ignores repeats, and closes/reconnects if it sees a gap or an invalid/backwards position. The reconnect paints a fresh state before reenabling drawing. If a shard cannot answer, the page remains disabled and retries instead of treating partial pixels as complete.
+
+### Undo, durable tile snapshots, replay, and hashes
+
+The coordinator records each session's successful draws and their previous pixel values. **Undo last draw** targets that session's most recent draw that has not already had an undo attempt. A successful undo restores the previous owner and color, or deletes the pixel if it was empty before the draw. If another session has overwritten the pixel, undo is recorded as skipped and leaves the newer pixel alone. Each session has at most ten undo attempts; reusing an `X-Operation-ID` retries the same attempt without consuming another slot. The shard logs both successful and skipped Undo events at the tile's next sequence, so migration and replay preserve their result.
+
+An active shard creates a durable checkpoint with `POST /tiles/{tile_id}/snapshots`. The response includes a snapshot ID, owner epoch, last tile sequence, and pixel count. `POST /tiles/{tile_id}/snapshots/{snapshot_id}/restore` installs that checkpoint's pixels and replays all later operations in sequence, including Clear and Undo. Restore fails rather than committing partial data if the log has a gap. A saved checkpoint lives in the same named shard volume as its operation log; losing that volume loses both. These are per-tile checkpoints, not a cross-shard snapshot catalog.
+
+`GET /hash` returns SHA-256 over visible pixel colors. Serialization includes a fixed canvas/version header, then occupied pixels in row-major tile order and local y/x order. Each line contains the tile index, local y, local x, and uppercase `#RRGGBB`. Ownership is excluded, so the same visible canvas hashes equally after migration to different shards. A hash verifies final state; it does not prove a chronological timelapse.
+
+To verify snapshot replay in PowerShell with Compose running, draw red at `(25,0)`, save a shard-2 checkpoint, draw blue, restore the checkpoint, and compare the hash before and after restore:
+
+```powershell
+$webSession = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+Invoke-WebRequest http://localhost:8000/ -WebSession $webSession | Out-Null
+$drawRed = @{ x = 25; y = 0; color = "#ff0000" } | ConvertTo-Json
+Invoke-RestMethod http://localhost:8000/draw -Method Post -ContentType "application/json" -Body $drawRed -WebSession $webSession | Out-Null
+$snapshot = docker compose exec shard-2 python -c "import json,urllib.request; r=urllib.request.Request('http://127.0.0.1:8002/tiles/tile-00-01/snapshots',data=b'',method='POST'); print(urllib.request.urlopen(r).read().decode())" | ConvertFrom-Json
+$drawBlue = @{ x = 25; y = 0; color = "#0000ff" } | ConvertTo-Json
+Invoke-RestMethod http://localhost:8000/draw -Method Post -ContentType "application/json" -Body $drawBlue -WebSession $webSession | Out-Null
+$expectedHash = (Invoke-RestMethod http://localhost:8000/hash).hash
+$snapshotId = $snapshot.snapshot_id
+docker compose exec shard-2 python -c "import urllib.request; sid='$snapshotId'; u='http://127.0.0.1:8002/tiles/tile-00-01/snapshots/'+sid+'/restore'; r=urllib.request.Request(u,data=b'',method='POST'); print(urllib.request.urlopen(r).read().decode())"
+$restoredHash = (Invoke-RestMethod http://localhost:8000/hash).hash
+$expectedHash -eq $restoredHash
+```
+
+The final PowerShell expression should print `True`; the restore response should report `status: restored` and the same last sequence as before restore. Shard 2 is the configured owner of tile `tile-00-01`. `docker compose exec` uses the container's internal port; Windows only publishes coordinator port `8000`.
+
+To verify the Undo button manually, draw a pixel twice with one session and click **Undo last draw** once; it should restore the first color. Then overwrite the pixel from another browser profile and click Undo in the original profile; the response reports a skipped undo and the newer color stays. The UI reports attempts used out of ten; an eleventh new attempt receives HTTP 429.
+
+To verify missed-update recovery in two browser tabs, open the canvas in both tabs using the same browser profile. In the first tab, open Developer Tools, select **Network**, and enable **Offline**. In the second tab, draw a pixel. Restore the first tab's network connection. It should briefly show **Disconnected — reconnecting...**, then return to **Connected — live collaboration enabled** with the missed pixel visible. Draw again and confirm both tabs update. A repeated event is ignored using its per-tile sequence; a skipped sequence triggers reconnect and an authoritative redraw.
+
+To verify Clear recovery, draw a pixel in one tab, take that tab offline, and use the second tab in the same browser profile to click **Clear my pixels** (both tabs share the session cookie). Restore the first tab's connection. The pixel should remain white after it resynchronizes. For coordinator restart recovery, leave a drawn pixel visible and run these commands in PowerShell from the repository root:
+
+```powershell
+docker compose ps
+docker compose restart coordinator
+docker compose logs --tail 100 coordinator
+```
+
+The browser should disable drawing while disconnected, reconnect after the coordinator is healthy, and redraw committed state from shard SQLite. `docker compose restart` preserves `coordinator_data`, `shard1_data`, `shard2_data`, and `shard3_data`; do not use `docker compose down -v` for this check. Only coordinator port `8000` is published to Windows; shard ports `8001`–`8003` are internal to the Compose network. To inspect status and follow reconnect logs:
+
+```powershell
+docker compose ps
+docker compose logs --tail 100 -f coordinator
+```
+
+Press Ctrl+C to stop following logs. `docker compose stop coordinator` followed by `docker compose start coordinator` also simulates an outage without removing volumes.
+
+`GET /tiles/{tile_id}/snapshot` returns a point-in-time pixel state and its last tile sequence. Migration installs that snapshot as destination state, then imports later operations. The importer now applies Clear events as well as draws. This provides deterministic replay within each tile; there is still no public full-canvas replay endpoint, global total order across different tiles, or long-term snapshot catalog.
+
+Files changed for this stage: `frontend/main.py` coordinates durable intent, retry, recovery, and history finalization; `shard/main.py` implements prepare/commit/finalize and Clear-aware snapshot replay; `frontend/index.html` preserves the request ID between retries; `tests/test_canvas.py` covers coordinator recovery and partial-Clear replay; `tests/test_ordered_operations.py` covers shard restart, sequence ordering, duplicate finalization, and snapshot restoration; the project docs record the protocol and limits.
+
+To build and start services after pulling or editing these files, run in PowerShell:
+
+```powershell
+docker compose up --build -d
+docker compose ps
+docker compose logs --tail 100 coordinator shard-1 shard-2 shard-3
+```
+
+The compose command rebuilds changed images and recreates the coordinator and shard processes. Ports remain coordinator `8000` on the host and shard ports `8001`–`8003` only inside `canvas-net`. Coordinator state (including Clear intents and history-finalization status) persists in `coordinator_data`; each shard's pixels, per-tile draw/Clear history, snapshots installed by migration, and participant records persist in its own `shard*_data` volume.
+
+To verify a Clear interrupted by a shard outage without deleting data:
+
+1. Open `http://localhost:8000/`, draw one or more pixels, then run `docker compose stop shard-2` in PowerShell.
+2. Click **Clear my pixels**. The request returns an incomplete message and retains its operation ID in that page. The coordinator records the intent and retries it in the background.
+3. Simulate a coordinator restart while the shard is still stopped with `docker compose restart coordinator`. The coordinator's pending intent remains in `coordinator_data`; recovery continues to retry.
+4. Restore the shard with `docker compose start shard-2`. Inspect recovery using `docker compose logs --tail 100 coordinator` and health using `Invoke-RestMethod http://localhost:8000/admin/shards`.
+5. Wait for the browser WebSocket to reconnect. The recovered operation publishes a refreshed state to connected clients. Clicking Clear again in the original page retries with the same ID; a repeated completed request does not clear a later draw.
+
+`docker compose restart shard-2` also safely restarts the shard while retaining its volume. `docker compose down` removes containers but preserves named data volumes. Do not use `docker compose down -v` for routine cleanup; it deletes those volumes and their databases.
+
+Open two browser windows at `http://localhost:8000/`, draw separate pixels, and clear one session. Its own pixels disappear while the other user's pixels remain. For focused tests, install development dependencies with `python -m pip install -r requirements-dev.txt`, then run `python -m pytest -q tests/test_canvas.py tests/test_ordered_operations.py`. For real service coverage, start Compose and run these PowerShell commands:
+
+```powershell
+$env:RUN_DOCKER_INTEGRATION = "1"
+python -m pytest -q tests/integration
+Remove-Item Env:RUN_DOCKER_INTEGRATION
+```
+
+Browser integration is opt-in and must use a disposable Compose project as described in README.
 
 ### Known versions and prerequisites
 
@@ -147,7 +245,7 @@ The coordinator obtains a session owner from the HTTP-only cookie, never a brows
 
 Each shard stores one row keyed by `(x,y)` with both colour and owner in one SQLite upsert. This preserves the most recent writer as current owner. The coordinator waits for the owning shard's committed response, checks its shard ID/tile/colour/owner receipt, then updates its in-memory cache and broadcasts. A failure or invalid receipt produces an error and is not broadcast.
 
-`GET /state` and new WebSocket snapshots combine records from all active shards; state reads fail instead of returning a silently incomplete canvas when a shard is unavailable. `DELETE /clear` asks every routing shard to delete rows for the caller's server-managed session ID, then broadcasts the removed coordinates when all calls succeed. Each shard's delete is locally transactional, but there is no distributed transaction across shards: a failure mid-clear can leave partial deletion and returns an error without a broadcast. A later state read reloads the stored result.
+`GET /state` and new WebSocket snapshots combine records from all active shards; state reads fail instead of returning a silently incomplete canvas when a shard is unavailable. `DELETE /clear` prepares owner-scoped coordinates on every shard, commits pixel deletion, then finalizes per-tile Clear history after all participants commit. It broadcasts only after the coordinator marks the full operation complete. A failure can leave partial pixel deletion while recovery is pending; there is no distributed transaction across shards.
 
 One `asyncio.Lock` covers coordinator state reads, shard operations, cache updates, WebSocket registration/snapshots, and broadcasts. In a single coordinator process it orders a draw and a clear and prevents a snapshot from racing with a write. It is not a guarantee across multiple coordinator processes.
 
@@ -155,17 +253,17 @@ One `asyncio.Lock` covers coordinator state reads, shard operations, cache updat
 
 Compose places all four services on `canvas-net`. The coordinator checks configured URLs such as `http://shard-1:8001/health`; each shard checks its own SQLite connection and returns its configured ID and service version. `/admin/shards` makes the probes concurrently with short timeouts and returns per-shard health, including unavailable nodes.
 
-Each shard has `infrastructure_records` and `pixels` tables in its own `/data/shard.sqlite3`. `POST /pixels` validates the deterministic owner before upserting; `GET /pixels` returns that shard's pixel records; `DELETE /pixels?user_id=...` clears only that user on that shard. `shard1_data`, `shard2_data`, and `shard3_data` are separate Docker-managed named volumes mounted at `/data`. Pixel records are durable when those volumes work, but no operation history, epochs, snapshots, or migration state is present.
+Each shard has `infrastructure_records`, `pixels`, `tile_ownership`, `pixel_operations`, `clear_operations`, and `tile_snapshots` tables in its own `/data/shard.sqlite3`. `POST /pixels` validates the tile's current local epoch before committing the pixel and ordered draw log; `POST /undo` appends a conditional Undo event; Clear `prepare`, `commit`, and `finalize` routes persist participant work and ordered history. Snapshot restore replays later draw, Clear, and Undo events. `DELETE /pixels?user_id=...` remains a legacy one-shard endpoint and bypasses coordinator Clear recovery. `shard1_data`, `shard2_data`, and `shard3_data` are separate Docker-managed named volumes mounted at `/data`; the shard's current records, snapshots, and operation tables survive process restarts while those volumes remain intact.
 
 ## D. File-by-file guide
 
 | File | Responsibility and relationships |
 |---|---|
-| `frontend/main.py` | Coordinator app, HTTP routes, cookie sessions, current pixel ownership, WebSocket manager, and live shard health probes. Serves `index.html`; imports HTTPX for shard probes. |
-| `frontend/index.html` | Browser UI, Canvas drawing, HTTP draw/clear requests, WebSocket state/update rendering. |
+| `frontend/main.py` | Coordinator app, HTTP routes, cookie sessions, durable user action/Undo bookkeeping, current pixel ownership, WebSocket manager, final-state hashing, and shard health probes. Serves `index.html`. |
+| `frontend/index.html` | Browser UI, Canvas drawing, draw/undo/clear requests, WebSocket state/update rendering. |
 | `shared/tiles.py` | Shared strict coordinate validation, stable row-major tile IDs, canonical shard ID configuration, and deterministic owner selection. Both coordinator and shard import it. |
 | `shared/__init__.py` | Marks `shared` as an importable package so both images can load the same routing code. |
-| `shard/main.py` | Factory for the common shard FastAPI app, SQLite setup, infrastructure record APIs, deterministic per-pixel owner validation, and pixel read/write/clear APIs. Compose starts this same module three times. |
+| `shard/main.py` | Factory for the common shard FastAPI app, SQLite setup, durable tile snapshots, draw/Clear/Undo logs, replay, and pixel ownership APIs. Compose starts this same module three times. |
 | `shard/__init__.py` | Marks `shard` as an importable Python package for Uvicorn and tests. |
 | `docker/coordinator.Dockerfile` | Builds the coordinator image with Python dependencies and `frontend/`; starts Uvicorn on port 8000. |
 | `docker/shard.Dockerfile` | Builds the common shard image and starts Uvicorn on the environment-provided internal port. |
@@ -216,15 +314,19 @@ Each shard has `infrastructure_records` and `pixels` tables in its own `/data/sh
 
 **`home(request)` — `GET /`** reads the request cookie, calls `session_for`, serves the adjacent `index.html`, and sets `canvas_session` with `httponly=True` and `samesite="lax"`. It returns a `FileResponse`; it creates a session only when needed. The cookie is not Secure in this local HTTP setup.
 
-**`get_state(request)` route `GET /state` resolves/creates the browser session, acquires `canvas_lock`, reloads records from every active shard into the coordinator cache, then returns coordinate/color data plus the cookie. It returns HTTP 503 if shard state cannot be read completely. The browser gets its initial render from WebSocket instead.
+**`get_state(request)` route `GET /state` resolves/creates the browser session, acquires `canvas_lock`, reloads authoritative pixels and active per-tile sequence positions, then returns `{pixels, positions}` plus the cookie. It returns HTTP 503 if shard state cannot be read completely. The browser gets its initial render from WebSocket.
 
-**`draw(request, http_request)` route `POST /draw` validates strict integer coordinates and HEX color through `DrawRequest`, gets owner identity from the cookie, calls `tile_for_pixel` and `shard_for_tile`, then under `canvas_lock` sends `POST /pixels` to exactly that shard. It checks the commit receipt status, shard ID, tile ID, color, and owner. Only after the receipt matches does it update the local cache and broadcast. It returns status, coordinates, color, tile ID, shard ID, and cookie; shard failure returns an error without cache update or broadcast. The lock serializes this single coordinator but provides no operation IDs or cross-coordinator ordering.
+**`draw(request, http_request)` route `POST /draw` validates strict integer coordinates and HEX color through `DrawRequest`, gets owner identity from the cookie, assigns or accepts an operation ID, and records a durable per-session action intent and previous pixel value. Under `canvas_lock` it sends `POST /pixels` to the current owner. The shard appends its per-tile sequence with the pixel write and returns the prior pixel state. The coordinator completes the action ledger, updates its cache, and broadcasts after receipt. Per-session action order is durable; different users and tiles do not get one global order.
 
-**`clear_my_pixels(request)` route `DELETE /clear` gets owner from the session cookie and under `canvas_lock` sends a delete-by-user request to every active shard. Each shard removes only rows currently owned by that session. The coordinator updates its cache and broadcasts combined coordinates only when every request succeeds, then returns the removed count and cookie. A previous owner cannot remove an overwrite. A repeated clear returns zero when all shards respond. There is no atomic transaction across shards: a failure after one shard deletes can leave partial deletion, return an error, and suppress the event. This is a Stage 3A limitation.
+**`clear_my_pixels(request)` route `DELETE /clear` gets owner from the session cookie and a stable ID from `X-Operation-ID` (or creates one for non-browser callers). It persists the participant list before asking shards to prepare. Each shard persists the user's currently owned coordinates. After all prepares, the coordinator persists the coordinate set and commits each shard idempotently. Once all pixel commits succeed, it enters `finalizing`; each shard appends per-tile Clear events at the tile's next sequence. The coordinator returns success only after every participant finalizes history and the response state is reconciled. Shard failures leave a durable unfinished record; recovery retries commit and history finalization after restart. The browser keeps the same ID until it receives success. This is recoverable, not atomic. A history-finalization outage can leave events on only some shards, but the coordinator remains pending and blocks migration/replay until recovery finishes.
 
-**`websocket_endpoint(websocket)` route `WS /ws` reads and validates the registered cookie, accepts the socket, then under `canvas_lock` reloads pixels from every active shard and sends a full color-only snapshot before later operations can proceed. If shard reads fail, it closes with code 1011. It waits for client messages only to keep the socket open; draw commands use HTTP. Disconnects and errors are cleaned up in `finally`. This prevents snapshot/update races in the single coordinator process.
+**`websocket_endpoint(websocket)` route `WS /ws` reads and validates the registered cookie, accepts the socket, then under `canvas_lock` reads pixels and tile positions, registers the socket, and sends a `state` snapshot before later mutations can proceed. A shard read failure closes with code 1011. It waits for client messages only to keep the socket open; draw commands use HTTP. Disconnects and errors are cleaned up in `finally`. Together with event cursors, this closes the snapshot-to-live-update gap in the single coordinator process.
 
-**`DrawRequest`** is the Pydantic input model used by `/draw`. Its three fields validate bounds and HEX syntax before the route mutates shared state. It has no custom methods or side effects.
+**`undo_last_draw(request, x_operation_id)` route `POST /undo`** counts a durable attempt per session, with a limit of ten and idempotent retry IDs. It selects that session's latest draw, retries any pending shard write by operation ID, and asks the current tile owner to restore the recorded previous pixel only if owner/color still match. A newer overwrite becomes a sequenced skipped event. Successful and skipped outcomes are kept in the tile log and broadcast with their sequence position.
+
+**`get_canvas_hash()` route `GET /hash`** reloads authoritative pixels from all current shard owners and hashes visible colors using the documented canonical serialization. It returns the SHA-256 algorithm, format description, occupied pixel count, and digest; owner metadata is excluded.
+
+**`DrawRequest`** is the Pydantic input model used by `/draw`. It validates bounds, HEX syntax, and an optional operation ID before the route mutates shared state. It has no custom methods or side effects.
 
 ### `shard/main.py`
 
@@ -252,11 +354,21 @@ Each shard has `infrastructure_records` and `pixels` tables in its own `/data/sh
 
 **`get_record(record_key)` — shard `GET /records/{record_key}`** parameterizes the lookup. It returns the row or raises HTTP 404 if absent; it never creates data.
 
-**`write_pixel(pixel)` route `POST /pixels`** converts the pixel coordinates to a `TileAddress`, rejects a mismatched tile ID with 422, and calculates the expected owner shard. If this service is not the owner it returns 409 without writing. Otherwise it performs one parameterized SQLite upsert that replaces the entire coordinate row (color and owner together), commits, and returns a commit receipt. It relies on the coordinator to provide the session owner and does not implement operation IDs or epochs.
+**`write_pixel(pixel)` route `POST /pixels`** validates the tile, operation ID, current ownership epoch, and any in-progress local Clear participant. A new draw is written with its `pixel_operations` row and incremented per-tile sequence in one SQLite transaction; the receipt also records the prior pixel state for user-aware Undo. Repeating an operation ID with identical content returns the stored result without incrementing the sequence; conflicting content is rejected. The shard relies on the coordinator to provide the session owner.
+
+**`undo_pixel(undo)` route `POST /undo`** verifies current tile epoch, owner, and expected color in one SQLite transaction. If eligible, it restores the supplied prior pixel or deletes the pixel, then appends a typed Undo history event at the next tile sequence. If another user owns the pixel, it appends a no-effect skipped event instead. Retries return the original result by operation ID.
+
+**`create_tile_snapshot(tile_id)` route `POST /tiles/{tile_id}/snapshots`** stores immutable pixel rows plus the tile epoch and last sequence in `tile_snapshots`. It only snapshots an active tile owner. The snapshot and operation log share the shard database volume.
+
+**`restore_tile_snapshot(tile_id, snapshot_id)` route `POST /tiles/{tile_id}/snapshots/{snapshot_id}/restore`** resets an active tile to the stored checkpoint, applies every later contiguous draw, Clear, and Undo entry, and commits the result in one local SQLite transaction. A gap or invalid operation aborts the restore. It retains the existing current epoch and sequence high-water mark.
 
 **`list_pixels()` route `GET /pixels`** reads this shard's rows ordered by y then x and returns them with owner metadata for coordinator aggregation. It does not query another shard.
 
-**`clear_owned_pixels(user_id)` route `DELETE /pixels?user_id=...`** selects the caller's coordinates and deletes rows for that user in one local SQLite transaction, then returns removed coordinates. It only guarantees atomicity on this one database, not across all shards.
+**`tile_positions()` route `GET /tiles/positions`** returns durable epoch and last committed sequence rows from `tile_ownership`, including a fenced source until the coordinator records a transferred tile's new owner. The coordinator filters by its ownership registry, so snapshot pixels and cursors use the same owner at cutover. Uninitialized tiles are omitted and start at epoch 1, sequence 0.
+
+**`clear_owned_pixels(user_id)` route `DELETE /pixels?user_id=...`** is a legacy shard-local endpoint. It selects the caller's coordinates and deletes rows for that user in one local SQLite transaction, then returns removed coordinates. It bypasses the coordinator's recoverable cross-shard protocol and must not be used to perform a canvas-wide Clear.
+
+**`import_operations(tile_id, batch)` route `POST /tiles/{tile_id}/import-operations`** installs later per-tile history after a migration snapshot. It validates contiguous sequence numbers and operation IDs, imports draw, Clear, and Undo records idempotently, and applies only the next sequence to the snapshot pixels. This is the snapshot-plus-log replay path; it is used by migration, not exposed as a public whole-canvas replay API.
 
 The module-level **`app = create_app()`** is the object Uvicorn imports in each shard container. The factory's default local DB path is under `shard/data`; Compose overrides it to `/data/shard.sqlite3` inside each named volume.
 
@@ -276,9 +388,9 @@ The module-level **`app = create_app()`** is the object Uvicorn imports in each 
 
 The anonymous **WebSocket `open` callback** updates the status text after the connection opens; it receives the browser event and does not change server state.
 
-The **WebSocket `message` callback** parses event JSON. For `state`, it paints the canvas white and redraws each returned coordinate. For `draw`, it calls `paint` with the event's coordinate and colour. For `clear`, it paints the listed coordinates white. Its parameter is the browser message event; its side effect is UI rendering only.
+The **WebSocket `message` callback** parses event JSON. For `state`, it paints the canvas white, redraws the returned coordinates, and replaces its per-tile epoch/sequence cursors before enabling input. For `draw`, it validates the tile cursor, ignores a duplicate, applies the next sequence, or closes the socket on a gap. For `clear`, it validates all affected tile positions before applying the Clear; duplicates are ignored and gaps request a fresh snapshot. Its parameter is the browser message event; its side effect is UI rendering and cursor updates.
 
-The **WebSocket `close` callback** changes status to disconnected. The **`error` callback** reports a connection error. Both receive browser events and do not retry automatically.
+The **WebSocket `close` callback** disables drawing and schedules a reconnect with exponential backoff. The **`error` callback** closes the socket so the same resynchronization path runs. A successful `state` message resets the delay and reenables drawing.
 
 The **canvas `pointerdown` callback** maps pointer position within the displayed canvas to integer coordinates in the 1000×1000 logical grid, reads the selected colour, and posts JSON to `/draw`. It updates status on success and reports fetch/HTTP failure. The server remains authoritative; the callback does not locally paint the requested pixel.
 
@@ -325,6 +437,34 @@ Its fake **`PausingWebSocket.accept()`** takes no arguments beyond `self`, retur
 Its fake socket's **`send_json(message)`** appends each event and pauses after the draw event until the test releases its gate. It lets the test hold the actual application lock across the draw broadcast so a clear request can be shown waiting behind it.
 
 **`test_websocket_receives_state_and_committed_draw_update()`** checks the empty initial state and normalized draw event on a live TestClient WebSocket.
+
+**`test_reconnect_snapshot_recovers_missed_draw_and_clear()`** closes a live socket while draw, Clear, and another draw commit, then reconnects with the same session and checks the current pixels and tile sequence include all three operations.
+
+**`test_clients_connecting_at_different_times_get_current_cursors()`** connects one client, commits a draw, then connects another. It checks the later client's snapshot begins at the current cursor and both clients receive the next per-tile sequence.
+
+**`test_duplicate_draw_request_does_not_emit_duplicate_websocket_event()`** retries a draw with the same operation ID and verifies the shard's idempotent receipt does not produce a second live event.
+
+**`test_reconnect_after_coordinator_memory_restart_uses_durable_shard_state()`** clears process-local session and connection state, then reconnects with the persisted session cookie. It checks the current pixel and durable shard cursor are restored.
+
+**`test_canvas_hash_is_stable_for_pixel_order_and_color_case()`** checks that dictionary order and lower/uppercase HEX spelling do not change the canonical canvas hash.
+
+**`test_hash_endpoint_reports_canonical_sha256_for_authoritative_canvas()`** checks the endpoint's algorithm, serialization description, pixel count, and digest against the pure serializer.
+
+**`test_undo_skips_pixel_overwritten_by_another_user()`** confirms Alice's undo cannot remove Bob's later overwrite.
+
+**`test_undo_restores_prior_owner_when_current_user_undoes_overwrite()`** confirms Bob's eligible undo restores Alice's prior color and ownership.
+
+**`test_undo_attempt_limit_is_ten_per_session()`** submits ten distinct attempts and expects HTTP 429 on the eleventh.
+
+**`test_undo_action_survives_coordinator_restart()`** reuses the durable browser session after process-local state is cleared and checks the saved draw can still be undone.
+
+**`test_clear_recovery_finishes_after_a_participant_commit_failure()`** leaves one shard commit failed, closes the coordinator app lifespan, then starts a new lifespan against the same SQLite file. It verifies background recovery completes and broadcasts a refreshed canvas state.
+
+**`test_recovered_cross_shard_clear_replays_from_tile_snapshots()`** uses real shard FastAPI apps with separate SQLite files behind an in-process request adapter. It injects a failure after one shard commits, restarts the coordinator lifespan, waits for completion, then installs pre-Clear tile snapshots elsewhere and imports the subsequent logs. The restored tiles must be empty, proving recovery-generated Clear events replay after snapshot boundaries.
+
+**`test_undo_is_a_durable_replayable_tile_operation()`** restores Bob's undo after a snapshot, reapplies the same import batch and reopens the destination shard twice. Pixels and canonical hashes must match the source.
+
+**`test_saved_snapshot_restores_through_clear_replay_after_repeated_restarts()`** saves a checkpoint, applies a draw and Clear, restarts the shard three times, and repeatedly restores. The sequence and empty final state must match the reference, and retrying the pre-Clear draw ID must not resurrect its pixel.
 
 ### `tests/test_tiles.py`
 
@@ -375,6 +515,12 @@ Module setup skips the test unless `RUN_DOCKER_INTEGRATION=1` and the Docker CLI
 **`volume_name(shard)`** gets the running container ID and uses `docker inspect` to return the Docker volume mounted at `/data`.
 
 **`test_compose_shards_use_isolated_volumes_and_keep_records_after_restart()`** checks the live coordinator health overview, expected unique shard IDs/service URLs, and three different named volumes. It creates two independent cookie sessions and connects both to real coordinator WebSockets before drawing; each initial snapshot must match `/state`. Session A draws `(25,0)`, and the test checks `tile-00-01`/shard-2, the complete stored row's coordinate, tile ID, and color, the refreshed coordinator state, and a 409 plus no row when the same valid tile record is sent directly to shard-1. Session B then draws another pixel in the same tile; both sockets must receive each draw event, which verifies each browser observes the other's operation. Owner-scoped cleanup removes the new test sessions' rows, and any pre-existing rows at the two test coordinates are restored. The test also writes a random infrastructure record into shard-1, confirms shard-2 cannot read it, restarts shard-1, waits for health to return, and verifies the record remains. The test uses the `websockets` client supplied by `uvicorn[standard]` and is opt-in with `RUN_DOCKER_INTEGRATION=1`.
+
+**`test_offline_browser_resynchronizes_after_missed_clear_and_draw()`** is an opt-in Playwright browser test. It takes one tab offline while a second tab with the same session commits Clear and draw operations, restores connectivity, then verifies the first tab reconnects and paints the authoritative state.
+
+**`test_duplicate_clear_event_does_not_erase_a_later_draw()`** delays a duplicate Clear WebSocket frame until after a newer draw. The old Clear sequence must be ignored, leaving the later pixel visible.
+
+**`test_sequence_gap_forces_snapshot_resynchronization()`** drops one draw frame while leaving the socket open, then delivers the next tile sequence. The page detects the gap, reconnects, and restores both committed pixels from the state snapshot.
 
 ### `docker/`, `docker-compose.yml`, and configuration
 
@@ -450,14 +596,15 @@ Use the PowerShell write/restart/read commands in the [README verification secti
 |---|---|
 | Shared browser canvas and WebSocket draw/clear updates | Implemented through the coordinator; draws broadcast after a shard commit. Local API tests use fake shard stores. |
 | Server-issued HTTP-only session cookie | Implemented; session map is in coordinator memory, not durable authentication. |
-| Current pixel owner and owner-specific clear | Implemented in shard SQLite rows; overwrite ownership and concurrent draw/clear ordering are covered by local tests. Multi-shard Clear is not atomic if a shard fails mid-request. |
+| Current pixel owner and owner-specific clear | Implemented in shard SQLite rows. Durable prepare/commit/finalize records, stable browser operation IDs, per-tile Clear history, snapshot/import replay, restart recovery, and overwrite protection are implemented. Multi-shard Clear is recoverable but not atomic; an interruption can temporarily leave different shards at different phases. |
 | Coordinator and three independently configured shard containers | Compose/Dockerfiles are written. Actual startup has not been verified in this environment when Docker is unavailable. |
 | Shard health/info, infrastructure records, and routed pixel API | Implemented in source and covered by local app tests. Live Docker behavior is covered by an opt-in test that must be run against containers. |
 | Separate named volumes and persistence across restart | Configured; persistence is not considered proven until the real-container test passes. |
 | Tile mapping/routing and only-assigned-tile storage | Stage 3A implemented; deterministic modulo routing and shard-side ownership checks are locally tested. Live Docker routing remains unverified. |
-| Mutable ownership records, epochs, stale-epoch rejection, per-tile positions, operation IDs/deduplication | Planned for later stages; not implemented. |
-| Live tile migration, migration recovery, shard crash recovery | Planned; not implemented. |
-| Undo, atomic multi-shard clear, snapshots, hashes, timelapse | Planned; not implemented. Current clear fan-out can partially complete if a shard fails. |
+| Mutable ownership records, epochs, stale-epoch rejection, per-tile positions, draw/Clear operation IDs and deduplication | Implemented for tile-owned drawing and migration. Clear records use the same per-tile sequences as draws; a coordinator completion marker prevents migration replay while a Clear is partially finalized. |
+| Live tile migration, migration recovery, shard crash recovery | Implemented with a brief fenced cutover and durable transfer retry; Docker runtime verification depends on Docker availability. |
+| Per-tile durable checkpoints, replay, visible-canvas hash, and user-aware Undo | Implemented locally. Undo is limited to ten attempts per session and preserves a newer overwrite by another user. Hash excludes ownership and is placement-independent. Live Docker/browser verification is still pending. |
+| Chronological whole-canvas timelapse/reference frames and public whole-canvas replay | Not implemented. Per-tile sequence numbers cannot order updates across unrelated tiles; an exact timelapse needs a durable coordinator commit journal. Final-state reconstruction and hash verification are supported without that global order. |
 | Multiple coordinator replicas or cross-process WebSocket broadcast | Not implemented. The coordinator is a single point of failure. |
 
 ## Documentation maintenance rules for future phases

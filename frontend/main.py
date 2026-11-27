@@ -9,6 +9,8 @@ import secrets
 import uuid
 import sqlite3
 import time
+import json
+import hashlib
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -34,6 +36,10 @@ class ConnectionManager:
             except Exception:
                 logger.exception("WebSocket broadcast failed; dropping connection")
                 self.disconnect(connection)
+                try:
+                    await asyncio.wait_for(connection.close(code=1012, reason="Update delivery failed; resync required"), timeout=1.0)
+                except Exception:
+                    logger.debug("WebSocket was already closed after failed delivery")
 
     async def resync_all(self) -> None:
         """Force browsers to fetch an authoritative snapshot after an unknown commit."""
@@ -50,7 +56,7 @@ manager = ConnectionManager()
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    recovery_task = asyncio.create_task(recover_pending_transfers())
+    recovery_task = asyncio.create_task(recover_pending_work())
     try:
         yield
     finally:
@@ -99,7 +105,65 @@ def ownership_db() -> sqlite3.Connection:
     connection.execute("""CREATE TABLE IF NOT EXISTS transfers (
         tile_id TEXT PRIMARY KEY, source TEXT NOT NULL, destination TEXT NOT NULL,
         old_epoch INTEGER NOT NULL, phase TEXT NOT NULL)""")
+    connection.execute("""CREATE TABLE IF NOT EXISTS clear_operations (
+        operation_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, participants TEXT NOT NULL,
+        phase TEXT NOT NULL, coordinates TEXT NOT NULL DEFAULT '[]',
+        history_finalized INTEGER NOT NULL DEFAULT 0)""")
+    connection.execute("""CREATE TABLE IF NOT EXISTS user_action_counters (
+        user_id TEXT PRIMARY KEY, next_action INTEGER NOT NULL)""")
+    connection.execute("""CREATE TABLE IF NOT EXISTS user_draw_actions (
+        operation_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, action_order INTEGER NOT NULL,
+        shard_id TEXT NOT NULL, tile_id TEXT NOT NULL, x INTEGER NOT NULL, y INTEGER NOT NULL,
+        color TEXT NOT NULL, previous_pixel TEXT, epoch INTEGER NOT NULL,
+        sequence INTEGER, status TEXT NOT NULL, undone INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(user_id, action_order))""")
+    connection.execute("""CREATE TABLE IF NOT EXISTS undo_attempts (
+        attempt_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, status TEXT NOT NULL,
+        target_operation_id TEXT, response TEXT)""")
+    clear_columns = {row[1] for row in connection.execute("PRAGMA table_info(clear_operations)")}
+    if "history_finalized" not in clear_columns:
+        connection.execute("ALTER TABLE clear_operations ADD COLUMN history_finalized INTEGER NOT NULL DEFAULT 0")
+        # Earlier completed Clears were not ordered with tile operations and
+        # cannot be backfilled into replay history without inventing an order.
+        connection.execute("UPDATE clear_operations SET history_finalized=1 WHERE phase='committed'")
     return connection
+
+
+async def finish_clear(operation_id: str) -> dict:
+    """Resume a durable clear by preparing all shards before idempotent commits."""
+    with ownership_db() as connection:
+        op = connection.execute("SELECT * FROM clear_operations WHERE operation_id=?", (operation_id,)).fetchone()
+    if op is None:
+        raise ShardRequestError("coordinator", "clear operation not found", 404)
+    participants = json.loads(op["participants"])
+    prepared = await asyncio.gather(*(request_shard(s, "POST", f"/clear/{operation_id}/prepare",
+        params={"user_id": op["user_id"]}) for s in participants))
+    if any(result.get("status") != "prepared" or result.get("operation_id") != operation_id
+           or not isinstance(result.get("coordinates"), list) for result in prepared):
+        raise ShardRequestError("coordinator", "a shard returned an invalid clear prepare receipt", 502)
+    for result in prepared:
+        if any(not isinstance(point, dict) or type(point.get("x")) is not int
+               or type(point.get("y")) is not int for point in result["coordinates"]):
+            raise ShardRequestError("coordinator", "a shard returned invalid clear coordinates", 502)
+    coordinates = sorted({(p["x"], p["y"]) for result in prepared for p in result["coordinates"]})
+    with ownership_db() as connection:
+        connection.execute("UPDATE clear_operations SET phase='committing', coordinates=? WHERE operation_id=?",
+                           (json.dumps(coordinates), operation_id))
+    committed = await asyncio.gather(*(request_shard(s, "POST", f"/clear/{operation_id}/commit") for s in participants))
+    if any(result.get("status") != "committed" or result.get("operation_id") != operation_id
+           for result in committed):
+        raise ShardRequestError("coordinator", "a shard returned an invalid clear commit receipt", 502)
+    with ownership_db() as connection:
+        connection.execute("UPDATE clear_operations SET phase='finalizing' WHERE operation_id=?", (operation_id,))
+    finalized = await asyncio.gather(*(request_shard(s, "POST", f"/clear/{operation_id}/finalize")
+                                       for s in participants))
+    if any(result.get("status") != "finalized" or result.get("operation_id") != operation_id
+           for result in finalized):
+        raise ShardRequestError("coordinator", "a shard returned an invalid clear history receipt", 502)
+    with ownership_db() as connection:
+        connection.execute("UPDATE clear_operations SET phase='committed', history_finalized=1 WHERE operation_id=?", (operation_id,))
+    positions = [position for result in finalized for position in result.get("positions", [])]
+    return {"coordinates": coordinates, "participants": participants, "positions": positions}
 
 
 def pending_transfer(tile_id: str) -> sqlite3.Row | None:
@@ -141,6 +205,46 @@ async def recover_pending_transfers() -> None:
         await asyncio.sleep(1)
 
 
+async def recover_pending_work() -> None:
+    """Retry durable clear intents and tile transfers after coordinator restart."""
+    while True:
+        try:
+            with ownership_db() as connection:
+                clears = connection.execute(
+                    "SELECT operation_id FROM clear_operations WHERE phase != 'committed' OR history_finalized=0"
+                ).fetchall()
+            for clear in clears:
+                try:
+                    async with canvas_lock:
+                        with ownership_db() as connection:
+                            row = connection.execute(
+                                "SELECT phase, history_finalized FROM clear_operations WHERE operation_id=?",
+                                (clear["operation_id"],),
+                            ).fetchone()
+                        if row is None or (row["phase"] == "committed" and row["history_finalized"]):
+                            continue
+                        result = await finish_clear(clear["operation_id"])
+                        try:
+                            state = await load_canvas_snapshot()
+                            pixels.clear()
+                            pixels.update(state["cache"])
+                            await manager.broadcast({"type": "state", "pixels": state["pixels"],
+                                                     "positions": state["positions"]})
+                        except (ShardRequestError, ValueError):
+                            # Every participant committed; discard coordinates from
+                            # the cache and let the next snapshot retry the full read.
+                            for x, y in result["coordinates"]:
+                                pixels.pop(f"{x},{y}", None)
+                            await manager.broadcast({"type": "clear", "pixels": [list(point) for point in result["coordinates"]],
+                                                     "positions": result["positions"]})
+                except Exception:
+                    logger.exception("Clear recovery pending for %s", clear["operation_id"])
+            await recover_pending_transfers_once()
+        except Exception:
+            logger.exception("Could not scan pending durable work; retrying")
+        await asyncio.sleep(1)
+
+
 async def copy_tile_operations(source: str, destination: str, tile_id: str,
                                next_epoch: int, after: int, *, until: int | None = None,
                                max_pages: int | None = None) -> int:
@@ -173,6 +277,9 @@ async def transfer_tile(tile: TileAddress, destination: str) -> dict:
     """Copy while writes continue, then fence briefly and cut over."""
     async with tile_transfer_locks.setdefault(tile.tile_id, asyncio.Lock()):
         async with canvas_lock:
+            with ownership_db() as connection:
+                if connection.execute("SELECT 1 FROM clear_operations WHERE phase != 'committed' LIMIT 1").fetchone():
+                    raise HTTPException(status_code=503, detail="clear recovery pending; retry later")
             if destination not in configured_shard_ids():
                 raise HTTPException(status_code=422, detail="unknown destination shard")
             owner, epoch = ownership_for_tile(tile)
@@ -244,8 +351,8 @@ async def transfer_tile(tile: TileAddress, destination: str) -> dict:
                 connection.execute("UPDATE transfers SET phase = 'installed' WHERE tile_id = ?",
                                    (tile.tile_id,))
 
-        await request_shard(destination, "POST", f"{tile_path}/activate", params={"epoch": next_epoch})
         async with canvas_lock:
+            await request_shard(destination, "POST", f"{tile_path}/activate", params={"epoch": next_epoch})
             with ownership_db() as connection:
                 connection.execute("UPDATE tile_owners SET shard_id = ?, epoch = ? WHERE tile_id = ?",
                                    (destination, next_epoch, tile.tile_id))
@@ -311,6 +418,28 @@ def ensure_sessions_table(connection: sqlite3.Connection) -> None:
 
 def public_pixels() -> dict[str, str]:
     return {key: value["color"] for key, value in pixels.items()}
+
+
+def canonical_canvas_hash(pixel_colors: dict[str, str]) -> str:
+    """Hash visible colors in stable tile-row, tile-column, local-row order."""
+    serialized = bytearray(b"collaborative-pixel-canvas-v1|1000|1000\n")
+    ordered = []
+    for coordinate, color in pixel_colors.items():
+        try:
+            x_text, y_text = coordinate.split(",", 1)
+            x, y = int(x_text), int(y_text)
+            tile = tile_for_pixel(x, y)
+        except (ValueError, TypeError) as exc:
+            raise ValueError("invalid canvas pixel coordinate") from exc
+        if coordinate != f"{x},{y}":
+            raise ValueError("canvas coordinates must use canonical decimal form")
+        if (not isinstance(color, str) or len(color) != 7 or color[0] != "#"
+                or any(character not in "0123456789abcdefABCDEF" for character in color[1:])):
+            raise ValueError("invalid canvas pixel color")
+        ordered.append((tile.tile_index, y % 25, x % 25, color.upper()))
+    for tile_index, local_y, local_x, color in sorted(ordered):
+        serialized.extend(f"{tile_index:04d},{local_y:02d},{local_x:02d},{color}\n".encode("ascii"))
+    return hashlib.sha256(serialized).hexdigest()
 
 
 def configured_shards() -> list[tuple[str, str]]:
@@ -381,6 +510,62 @@ async def load_pixels_from_shards() -> dict[str, dict[str, str]]:
     return state
 
 
+async def load_canvas_snapshot() -> dict:
+    """Read pixels and per-tile cursors while the coordinator lock is held."""
+    shard_ids = configured_shard_ids()
+    pixel_results, position_results = await asyncio.gather(
+        asyncio.gather(*(request_shard(shard_id, "GET", "/pixels") for shard_id in shard_ids)),
+        asyncio.gather(*(request_shard(shard_id, "GET", "/tiles/positions") for shard_id in shard_ids)),
+    )
+    state: dict[str, str] = {}
+    cache: dict[str, dict[str, str]] = {}
+    for shard_id, result in zip(shard_ids, pixel_results):
+        for pixel in result.get("pixels", []):
+            tile = tile_for_pixel(pixel["x"], pixel["y"])
+            if ownership_for_tile(tile)[0] == shard_id:
+                key = f"{pixel['x']},{pixel['y']}"
+                state[key] = pixel["color"]
+                cache[key] = {"color": pixel["color"], "owner": pixel["owner"]}
+    positions: dict[str, dict[str, int]] = {}
+    for result in position_results:
+        for position in result.get("positions", []):
+            tile = tile_from_id(position["tile_id"])
+            if ownership_for_tile(tile)[0] != result.get("shard_id"):
+                continue
+            positions[position["tile_id"]] = {
+                "epoch": position["epoch"], "sequence": position["last_sequence"],
+            }
+    return {"pixels": state, "positions": positions, "cache": cache}
+
+
+async def commit_user_draw_action(operation_id: str) -> dict:
+    """Complete or retry the shard write attached to a durable per-user action."""
+    with ownership_db() as connection:
+        action = connection.execute(
+            "SELECT * FROM user_draw_actions WHERE operation_id=?", (operation_id,)
+        ).fetchone()
+    if action is None:
+        raise ShardRequestError("coordinator", "draw action not found", 404)
+    tile = tile_from_id(action["tile_id"])
+    shard_id, epoch = ownership_for_tile(tile)
+    result = await request_shard(shard_id, "POST", "/pixels", body={
+        "x": action["x"], "y": action["y"], "tile_id": action["tile_id"],
+        "color": action["color"], "owner": action["user_id"],
+        "epoch": epoch, "operation_id": operation_id,
+    })
+    expected = {"status": "committed", "tile_id": action["tile_id"],
+                "color": action["color"], "owner": action["user_id"]}
+    if (any(result.get(field) != value for field, value in expected.items())
+            or (not result.get("duplicate") and result.get("shard_id") != shard_id)):
+        raise ShardRequestError(shard_id, "owner shard returned an invalid commit receipt", 502)
+    with ownership_db() as connection:
+        connection.execute(
+            "UPDATE user_draw_actions SET shard_id=?, epoch=?, sequence=?, status='committed' WHERE operation_id=?",
+            (shard_id, result["epoch"], result["sequence"], operation_id),
+        )
+    return result
+
+
 async def inspect_shard(shard_id: str, url: str) -> dict:
     result = {"shard_id": shard_id, "url": url}
     try:
@@ -447,14 +632,30 @@ async def get_state(request: Request):
     token, _ = session_for(request.cookies.get(SESSION_COOKIE))
     try:
         async with canvas_lock:
+            state = await load_canvas_snapshot()
             pixels.clear()
-            pixels.update(await load_pixels_from_shards())
-            state = public_pixels()
+            pixels.update(state["cache"])
     except (ShardRequestError, ValueError) as exc:
         raise HTTPException(status_code=503, detail="canvas storage is unavailable") from exc
-    response = JSONResponse({"pixels": state})
+    response = JSONResponse({"pixels": state["pixels"], "positions": state["positions"]})
     response.set_cookie(SESSION_COOKIE, token, httponly=True, samesite="lax", max_age=SESSION_TTL_SECONDS)
     return response
+
+
+@app.get("/hash")
+async def get_canvas_hash():
+    """Return a placement-independent SHA-256 hash of visible canvas pixels."""
+    try:
+        async with canvas_lock:
+            state = await load_canvas_snapshot()
+    except (ShardRequestError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail="canvas storage is unavailable") from exc
+    return {
+        "algorithm": "sha256",
+        "serialization": "collaborative-pixel-canvas-v1; tile row-major, local y/x; uppercase #RRGGBB; colors only",
+        "pixels": len(state["pixels"]),
+        "hash": canonical_canvas_hash(state["pixels"]),
+    }
 
 
 @app.post("/draw")
@@ -466,37 +667,48 @@ async def draw(request: DrawRequest, http_request: Request):
     key = f"{request.x},{request.y}"
     try:
         async with canvas_lock:
+            with ownership_db() as connection:
+                if connection.execute("SELECT 1 FROM clear_operations WHERE phase != 'committed' LIMIT 1").fetchone():
+                    raise HTTPException(status_code=503, detail="clear recovery pending; retry later")
             transfer = pending_transfer(tile.tile_id)
             if transfer is not None and transfer["phase"] != "preparing":
                 raise HTTPException(status_code=503, detail="tile transfer pending; retry later")
             shard_id, epoch = ownership_for_tile(tile)
-            committed = await request_shard(
-                shard_id,
-                "POST",
-                "/pixels",
-                body={
-                    "x": request.x,
-                    "y": request.y,
-                    "tile_id": tile.tile_id,
-                    "color": color,
-                    "owner": user_id,
-                    "epoch": epoch,
-                    "operation_id": operation_id,
-                },
-            )
-            if any(
-                committed.get(field) != expected
-                for field, expected in {
-                    "status": "committed",
-                    "tile_id": tile.tile_id,
-                    "color": color,
-                    "owner": user_id,
-                }.items()
-            ) or (not committed.get("duplicate") and committed.get("shard_id") != shard_id):
-                raise ShardRequestError(shard_id, "owner shard returned an invalid commit receipt", 502)
+            with ownership_db() as connection:
+                action = connection.execute(
+                    "SELECT * FROM user_draw_actions WHERE operation_id=?", (operation_id,)
+                ).fetchone()
+            if action is not None:
+                if (action["user_id"] != user_id or action["x"] != request.x
+                        or action["y"] != request.y or action["color"] != color):
+                    raise HTTPException(status_code=409, detail="draw operation ID reused with different action")
+            else:
+                shard_pixels = await request_shard(shard_id, "GET", "/pixels")
+                prior = next((record for record in shard_pixels.get("pixels", [])
+                              if record.get("x") == request.x and record.get("y") == request.y), None)
+                with ownership_db() as connection:
+                    row = connection.execute(
+                        "SELECT next_action FROM user_action_counters WHERE user_id=?", (user_id,)
+                    ).fetchone()
+                    action_order = row["next_action"] if row else 1
+                    connection.execute(
+                        "INSERT INTO user_action_counters(user_id,next_action) VALUES(?,?) "
+                        "ON CONFLICT(user_id) DO UPDATE SET next_action=excluded.next_action",
+                        (user_id, action_order + 1),
+                    )
+                    connection.execute(
+                        """INSERT INTO user_draw_actions(
+                            operation_id,user_id,action_order,shard_id,tile_id,x,y,color,
+                            previous_pixel,epoch,status) VALUES(?,?,?,?,?,?,?,?,?,?,'pending')""",
+                        (operation_id, user_id, action_order, shard_id, tile.tile_id,
+                         request.x, request.y, color, json.dumps(prior) if prior else None, epoch),
+                    )
+            committed = await commit_user_draw_action(operation_id)
             if not committed.get("duplicate"):
                 pixels[key] = {"color": color, "owner": user_id}
-                await manager.broadcast({"type": "draw", "x": request.x, "y": request.y, "color": color})
+                await manager.broadcast({"type": "draw", "x": request.x, "y": request.y, "color": color,
+                                         "tile_id": tile.tile_id, "epoch": committed["epoch"],
+                                         "sequence": committed["sequence"]})
     except ShardRequestError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     response = JSONResponse({
@@ -508,57 +720,153 @@ async def draw(request: DrawRequest, http_request: Request):
     return response
 
 
+@app.post("/undo")
+async def undo_last_draw(request: Request, x_operation_id: str | None = Header(default=None)):
+    token, user_id = session_for(request.cookies.get(SESSION_COOKIE))
+    attempt_id = x_operation_id or str(uuid.uuid4())
+    if not attempt_id or len(attempt_id) > 100:
+        raise HTTPException(status_code=422, detail="invalid undo operation ID")
+    try:
+        async with canvas_lock:
+            with ownership_db() as connection:
+                if connection.execute("SELECT 1 FROM clear_operations WHERE phase != 'committed' LIMIT 1").fetchone():
+                    raise HTTPException(status_code=503, detail="clear recovery pending; retry later")
+            with ownership_db() as connection:
+                attempt = connection.execute(
+                    "SELECT * FROM undo_attempts WHERE attempt_id=?", (attempt_id,)
+                ).fetchone()
+                if attempt is not None and attempt["user_id"] != user_id:
+                    raise HTTPException(status_code=409, detail="undo operation ID belongs to another session")
+                if attempt is not None and attempt["status"] == "complete":
+                    result = json.loads(attempt["response"])
+                else:
+                    used = connection.execute(
+                        "SELECT COUNT(*) FROM undo_attempts WHERE user_id=?", (user_id,)
+                    ).fetchone()[0]
+                    if attempt is None and used >= 10:
+                        raise HTTPException(status_code=429, detail="maximum of ten undo attempts reached")
+                    if attempt is None:
+                        connection.execute(
+                            "INSERT INTO undo_attempts(attempt_id,user_id,status) VALUES(?,?,'pending')",
+                            (attempt_id, user_id),
+                        )
+                    result = None
+            if result is None:
+                with ownership_db() as connection:
+                    action = connection.execute(
+                        "SELECT * FROM user_draw_actions WHERE user_id=? AND undone=0 "
+                        "ORDER BY action_order DESC LIMIT 1", (user_id,),
+                    ).fetchone()
+                if action is None:
+                    result = {"status": "empty", "operation_id": attempt_id,
+                              "attempts_used": used + (1 if attempt is None else 0)}
+                    target_operation_id = None
+                else:
+                    # Reconcile a draw whose shard receipt was lost after its
+                    # durable intent was recorded, then undo it exactly once.
+                    if action["status"] == "pending":
+                        await commit_user_draw_action(action["operation_id"])
+                        with ownership_db() as connection:
+                            action = connection.execute(
+                                "SELECT * FROM user_draw_actions WHERE operation_id=?",
+                                (action["operation_id"],),
+                            ).fetchone()
+                    tile = tile_from_id(action["tile_id"])
+                    transfer = pending_transfer(tile.tile_id)
+                    if transfer is not None and transfer["phase"] != "preparing":
+                        raise HTTPException(status_code=503, detail="tile transfer pending; retry later")
+                    shard_id, epoch = ownership_for_tile(tile)
+                    undo_id = f"undo-{hashlib.sha256(attempt_id.encode()).hexdigest()}"
+                    result = await request_shard(shard_id, "POST", "/undo", body={
+                        "x": action["x"], "y": action["y"], "tile_id": action["tile_id"],
+                        "owner": user_id, "epoch": epoch,
+                        "action_operation_id": action["operation_id"],
+                        "operation_id": undo_id, "expected_color": action["color"],
+                        "previous_pixel": json.loads(action["previous_pixel"])
+                            if action["previous_pixel"] else None,
+                    })
+                    if (result.get("status") not in {"undone", "skipped"}
+                            or result.get("operation_id") != undo_id
+                            or result.get("tile_id") != action["tile_id"]
+                            or type(result.get("sequence")) is not int):
+                        raise ShardRequestError(shard_id, "owner shard returned an invalid undo receipt", 502)
+                    target_operation_id = action["operation_id"]
+                    if result["status"] == "undone":
+                        restored = result.get("previous_pixel")
+                        if restored is None:
+                            pixels.pop(f"{action['x']},{action['y']}", None)
+                        else:
+                            pixels[f"{action['x']},{action['y']}"] = {
+                                "color": restored["color"].upper(), "owner": restored["owner"],
+                            }
+                    result = {**result, "attempts_used": used + (1 if attempt is None else 0)}
+                with ownership_db() as connection:
+                    if target_operation_id is not None:
+                        connection.execute(
+                            "UPDATE user_draw_actions SET undone=1 WHERE operation_id=?",
+                            (target_operation_id,),
+                        )
+                    connection.execute(
+                        "UPDATE undo_attempts SET status='complete',target_operation_id=?,response=? "
+                        "WHERE attempt_id=?",
+                        (target_operation_id, json.dumps(result), attempt_id),
+                    )
+                if action is not None:
+                    await manager.broadcast({
+                        "type": "undo", "x": result["x"], "y": result["y"],
+                        "tile_id": result["tile_id"], "epoch": result["epoch"],
+                        "sequence": result["sequence"], "outcome": result["status"],
+                        "pixel": result.get("previous_pixel"),
+                    })
+    except ShardRequestError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    response = JSONResponse(result)
+    response.set_cookie(SESSION_COOKIE, token, httponly=True, samesite="lax", max_age=SESSION_TTL_SECONDS)
+    return response
+
+
 @app.delete("/clear")
 async def clear_my_pixels(request: Request):
     token, user_id = session_for(request.cookies.get(SESSION_COOKIE))
     shard_ids = configured_shard_ids()
+    operation_id = request.headers.get("X-Operation-ID") or str(uuid.uuid4())
     try:
         async with canvas_lock:
             with ownership_db() as connection:
                 if connection.execute("SELECT 1 FROM transfers LIMIT 1").fetchone():
                     raise HTTPException(status_code=503, detail="tile transfer pending; retry later")
-            results = await asyncio.gather(
-                *(
-                    request_shard(
-                        shard_id, "DELETE", "/pixels", params={"user_id": user_id}
-                    )
-                    for shard_id in shard_ids
-                ),
-                return_exceptions=True,
-            )
-            failure = next((result for result in results if isinstance(result, Exception)), None)
-            coordinates = [
-                [pixel["x"], pixel["y"]]
-                for result in results
-                if not isinstance(result, Exception)
-                for pixel in result["removed"]
-            ]
-            # A migrated tile can leave a fenced copy on its old shard. Only
-            # broadcast removals absent from the authoritative owner now.
+            with ownership_db() as connection:
+                old = connection.execute("SELECT user_id, phase, coordinates, history_finalized FROM clear_operations WHERE operation_id=?", (operation_id,)).fetchone()
+                if old and old["user_id"] != user_id:
+                    raise HTTPException(status_code=409, detail="operation ID already belongs to another session")
+                if old is None and connection.execute(
+                    "SELECT 1 FROM clear_operations WHERE phase != 'committed' LIMIT 1"
+                ).fetchone():
+                    raise HTTPException(status_code=503, detail="clear recovery pending; retry later")
+                already_committed = old is not None and old["phase"] == "committed" and old["history_finalized"]
+                connection.execute("INSERT OR IGNORE INTO clear_operations(operation_id,user_id,participants,phase) VALUES(?,?,?,'preparing')",
+                                   (operation_id, user_id, json.dumps(shard_ids)))
+                committed_coordinates = json.loads(old["coordinates"]) if already_committed else None
+            if already_committed:
+                coordinates = [list(point) for point in committed_coordinates]
+            else:
+                result = await finish_clear(operation_id)
+                coordinates = [list(point) for point in result["coordinates"]]
             try:
                 refreshed = await load_pixels_from_shards()
-            except (ShardRequestError, ValueError):
-                refreshed = None
-            if refreshed is not None:
-                coordinates = [[x, y] for x, y in sorted({tuple(point) for point in coordinates})
-                               if f"{x},{y}" not in refreshed]
                 pixels.clear()
                 pixels.update(refreshed)
-                if failure is None:
-                    await manager.broadcast({"type": "clear", "pixels": coordinates})
-                else:
-                    await manager.broadcast({"type": "state", "pixels": public_pixels()})
-            else:
-                await manager.broadcast({"type": "clear", "pixels": coordinates})
-                if failure is not None:
-                    await manager.resync_all()
-            if failure is not None:
-                return JSONResponse({"status": "partial", "cleared": len(coordinates),
-                                     "detail": "Some shards could not be cleared; refresh state before retrying"},
-                                    status_code=503)
+            except (ShardRequestError, ValueError):
+                # All commit receipts were already validated, so the Clear
+                # succeeded even if an unrelated state read is temporarily down.
+                for x, y in coordinates:
+                    pixels.pop(f"{x},{y}", None)
+            if not already_committed:
+                await manager.broadcast({"type": "clear", "pixels": coordinates,
+                                         "positions": result["positions"]})
     except ShardRequestError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
-    response = JSONResponse({"status": "ok", "cleared": len(coordinates)})
+    response = JSONResponse({"status": "ok", "cleared": len(coordinates), "operation_id": operation_id})
     response.set_cookie(SESSION_COOKIE, token, httponly=True, samesite="lax", max_age=SESSION_TTL_SECONDS)
     return response
 
@@ -577,13 +885,15 @@ async def websocket_endpoint(websocket: WebSocket):
         # after it as a WebSocket event, never lost between the two.
         async with canvas_lock:
             try:
+                state = await load_canvas_snapshot()
                 pixels.clear()
-                pixels.update(await load_pixels_from_shards())
+                pixels.update(state["cache"])
             except (ShardRequestError, ValueError):
                 await websocket.close(code=1011, reason="Canvas storage is unavailable")
                 return
             manager.active_connections.append(websocket)
-            await asyncio.wait_for(websocket.send_json({"type": "state", "pixels": public_pixels()}), timeout=2.0)
+            await asyncio.wait_for(websocket.send_json({"type": "state", "pixels": state["pixels"],
+                                                        "positions": state["positions"]}), timeout=2.0)
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:

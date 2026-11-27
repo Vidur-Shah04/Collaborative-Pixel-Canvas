@@ -157,11 +157,14 @@ def test_compose_shards_use_isolated_volumes_and_keep_records_after_restart():
         ):
             initial_a = json.loads(socket_a.recv(timeout=5))
             initial_b = json.loads(socket_b.recv(timeout=5))
-            # Both /state and the WebSocket snapshot expose public pixels as
-            # coordinate-to-colour strings, e.g. {"25,0": "#ABCDEF"}.
+            # Both /state and the WebSocket snapshot expose pixels plus the
+            # durable per-tile cursors used by browser gap detection.
             expected_snapshot = baseline["pixels"]
-            assert initial_a == {"type": "state", "pixels": expected_snapshot}
-            assert initial_b == {"type": "state", "pixels": expected_snapshot}
+            expected_positions = baseline["positions"]
+            assert initial_a == {"type": "state", "pixels": expected_snapshot,
+                                 "positions": expected_positions}
+            assert initial_b == {"type": "state", "pixels": expected_snapshot,
+                                 "positions": expected_positions}
 
             status, operation_a = browser_json(
                 browser_a, f"{COORDINATOR_URL}/draw", "POST",
@@ -170,7 +173,9 @@ def test_compose_shards_use_isolated_volumes_and_keep_records_after_restart():
             assert status == 200
             assert operation_a["tile_id"] == "tile-00-01"
             assert operation_a["shard_id"] == "shard-2"
-            expected_a = {"type": "draw", "x": 25, "y": 0, "color": "#ABCDEF"}
+            expected_a = {"type": "draw", "x": 25, "y": 0, "color": "#ABCDEF",
+                          "tile_id": operation_a["tile_id"], "epoch": operation_a["epoch"],
+                          "sequence": operation_a["sequence"]}
             assert json.loads(socket_a.recv(timeout=5)) == expected_a
             assert json.loads(socket_b.recv(timeout=5)) == expected_a
 
@@ -208,7 +213,9 @@ def test_compose_shards_use_isolated_volumes_and_keep_records_after_restart():
             assert status == 200
             assert operation_b["tile_id"] == "tile-00-01"
             assert operation_b["shard_id"] == "shard-2"
-            expected_b = {"type": "draw", "x": 26, "y": 0, "color": "#FEDCBA"}
+            expected_b = {"type": "draw", "x": 26, "y": 0, "color": "#FEDCBA",
+                          "tile_id": operation_b["tile_id"], "epoch": operation_b["epoch"],
+                          "sequence": operation_b["sequence"]}
             assert json.loads(socket_a.recv(timeout=5)) == expected_b
             assert json.loads(socket_b.recv(timeout=5)) == expected_b
     finally:

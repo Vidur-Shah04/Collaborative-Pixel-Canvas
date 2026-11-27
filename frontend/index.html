@@ -1,0 +1,323 @@
+
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Pixel Canvas</title>
+    <style>
+    body {
+      font-family: system-ui, sans-serif;
+      text-align: center;
+      margin: 24px;
+    }
+
+    .controls {
+      margin: 16px;
+      display: flex;
+      justify-content: center;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    canvas {
+      width: min(80vw, 700px);
+      height: min(80vw, 700px);
+      border: 1px solid #777;
+      image-rendering: pixelated;
+      cursor: crosshair;
+      touch-action: none;
+    }
+
+    button, input {
+      padding: 8px;
+    }
+  </style>
+  </head>
+  <body>
+    <h1>Collaborative Pixel Canvas</h1>
+
+    <div class="controls">
+      <label>
+        Colour:
+        <input id="color" type="color" value="#ff0000">
+      </label>
+      <button id="undo" disabled>Undo last draw (10 attempts)</button>
+      <button id="clear">Clear my pixels</button>
+      <label>Zoom <input id="zoom" type="range" min="1" max="8" value="1"></label>
+    </div>
+
+    <canvas id="canvas" width="1000" height="1000"></canvas>
+    <p id="status">Connecting...</p>
+
+    <script>
+    const canvas = document.getElementById("canvas");
+    const ctx = canvas.getContext("2d");
+    const colorInput = document.getElementById("color");
+    const status = document.getElementById("status");
+    const clearButton = document.getElementById("clear");
+    const undoButton = document.getElementById("undo");
+    let pendingClearId = null;
+    let pendingUndoId = null;
+    const zoom = document.getElementById("zoom");
+    let ready = false;
+    let reconnectDelay = 500;
+    let socket;
+    let reconnectScheduled = false;
+    let tilePositions = {};
+
+    function setReady(value) {
+      ready = value;
+      clearButton.disabled = !value;
+      undoButton.disabled = !value;
+      canvas.style.cursor = value ? "crosshair" : "wait";
+    }
+    setReady(false);
+
+    function applyZoom() {
+      const size = Math.min(window.innerWidth * 0.8, 700) * Number(zoom.value);
+      canvas.style.width = `${size}px`;
+      canvas.style.height = `${size}px`;
+    }
+    zoom.addEventListener("input", applyZoom);
+    window.addEventListener("resize", applyZoom);
+    applyZoom();
+
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, 1000, 1000);
+
+    function paint(x, y, color) {
+      ctx.fillStyle = color;
+      ctx.fillRect(x, y, 1, 1);
+    }
+
+    const wsProtocol =
+      window.location.protocol === "https:" ? "wss:" : "ws:";
+
+    async function connect() {
+      setReady(false);
+      status.textContent = "Synchronizing canvas...";
+      socket = new WebSocket(`${wsProtocol}//${window.location.host}/ws`);
+      socket.addEventListener("message", (event) => {
+      let message;
+      try { message = JSON.parse(event.data); }
+      catch (_) { requestResync(); return; }
+
+      if (message.type === "state") {
+        if (!validSnapshot(message)) { requestResync(); return; }
+        ctx.fillStyle = "#ffffff";
+        ctx.fillRect(0, 0, 1000, 1000);
+
+        for (const [key, color] of Object.entries(message.pixels)) {
+          const [x, y] = key.split(",").map(Number);
+          paint(x, y, color);
+        }
+        tilePositions = message.positions;
+        reconnectDelay = 500;
+        reconnectScheduled = false;
+        setReady(true);
+        status.textContent = "Connected — live collaboration enabled";
+      }
+
+      if (message.type === "draw") {
+        if (!Number.isInteger(message.x) || !Number.isInteger(message.y) ||
+            message.x < 0 || message.x >= 1000 || message.y < 0 || message.y >= 1000 ||
+            message.tile_id !== tileIdFor(message.x, message.y) ||
+            typeof message.color !== "string" || !/^#[0-9A-Fa-f]{6}$/.test(message.color)) {
+          requestResync(); return;
+        }
+        const disposition = checkPosition(message.tile_id, message.epoch, message.sequence);
+        if (disposition === "gap") { requestResync(); return; }
+        if (disposition === "duplicate") return;
+        tilePositions[message.tile_id] = {epoch: message.epoch, sequence: message.sequence};
+        paint(message.x, message.y, message.color);
+      }
+
+      if (message.type === "clear") {
+        if (!Array.isArray(message.positions) || !Array.isArray(message.pixels)) { requestResync(); return; }
+        if (message.positions.some((position) => !position || typeof position !== "object" ||
+            typeof position.tile_id !== "string")) { requestResync(); return; }
+        const positionTiles = new Set(message.positions.map((position) => position.tile_id));
+        if (positionTiles.size !== message.positions.length || message.pixels.some((point) =>
+          !Array.isArray(point) || point.length !== 2 || !Number.isInteger(point[0]) ||
+          !Number.isInteger(point[1]) || point[0] < 0 || point[0] >= 1000 ||
+          point[1] < 0 || point[1] >= 1000 || !positionTiles.has(tileIdFor(point[0], point[1])))) {
+          requestResync(); return;
+        }
+        const dispositions = message.positions.map((position) =>
+          checkPosition(position.tile_id, position.epoch, position.sequence));
+        if (dispositions.includes("gap") || (dispositions.includes("duplicate") && dispositions.includes("new"))) {
+          requestResync(); return;
+        }
+        if (dispositions.length && dispositions.every((disposition) => disposition === "duplicate")) return;
+        message.positions.forEach((position) => {
+          tilePositions[position.tile_id] = {epoch: position.epoch, sequence: position.sequence};
+        });
+        for (const [x, y] of message.pixels) {
+          ctx.fillStyle = "#ffffff";
+          ctx.fillRect(x, y, 1, 1);
+        }
+      }
+
+      if (message.type === "undo") {
+        if (!Number.isInteger(message.x) || !Number.isInteger(message.y) ||
+            message.x < 0 || message.x >= 1000 || message.y < 0 || message.y >= 1000 ||
+            message.tile_id !== tileIdFor(message.x, message.y) ||
+            !["undone", "skipped"].includes(message.outcome) ||
+            (message.pixel !== null && (!message.pixel || message.pixel.x !== message.x ||
+              message.pixel.y !== message.y || typeof message.pixel.color !== "string" ||
+              !/^#[0-9A-Fa-f]{6}$/.test(message.pixel.color)))) {
+          requestResync(); return;
+        }
+        const disposition = checkPosition(message.tile_id, message.epoch, message.sequence);
+        if (disposition === "gap") { requestResync(); return; }
+        if (disposition === "duplicate") return;
+        tilePositions[message.tile_id] = {epoch: message.epoch, sequence: message.sequence};
+        if (message.outcome === "undone") {
+          if (message.pixel) paint(message.x, message.y, message.pixel.color);
+          else {
+            ctx.fillStyle = "#ffffff";
+            ctx.fillRect(message.x, message.y, 1, 1);
+          }
+        }
+      }
+      });
+      socket.addEventListener("close", () => {
+        setReady(false);
+        scheduleReconnect();
+      });
+      socket.addEventListener("error", () => socket.close());
+    }
+
+    function checkPosition(tileId, epoch, sequence) {
+      if (typeof tileId !== "string" || !Number.isInteger(epoch) || !Number.isInteger(sequence)) {
+        return "gap";
+      }
+      const previous = tilePositions[tileId];
+      if (previous && sequence <= previous.sequence) return "duplicate";
+      const expected = previous ? previous.sequence + 1 : 1;
+      if (sequence !== expected || (previous && epoch < previous.epoch)) {
+        return "gap";
+      }
+      return "new";
+    }
+
+    function tileIdFor(x, y) {
+      const row = String(Math.floor(y / 25)).padStart(2, "0");
+      const column = String(Math.floor(x / 25)).padStart(2, "0");
+      return `tile-${row}-${column}`;
+    }
+
+    function validSnapshot(message) {
+      if (!message.pixels || typeof message.pixels !== "object" || Array.isArray(message.pixels) ||
+          !message.positions || typeof message.positions !== "object" || Array.isArray(message.positions)) return false;
+      if (Object.entries(message.pixels).some(([key, color]) => {
+        const match = /^(\d+),(\d+)$/.exec(key);
+        if (!match || !/^#[0-9A-Fa-f]{6}$/.test(color)) return true;
+        const x = Number(match[1]), y = Number(match[2]);
+        return !Number.isInteger(x) || !Number.isInteger(y) || x < 0 || x >= 1000 || y < 0 || y >= 1000;
+      })) return false;
+      return Object.entries(message.positions).every(([tileId, position]) =>
+        /^tile-\d{2}-\d{2}$/.test(tileId) && position && Number.isInteger(position.epoch) &&
+        position.epoch >= 1 && Number.isInteger(position.sequence) && position.sequence >= 0);
+    }
+
+    function requestResync() {
+      setReady(false);
+      if (socket && socket.readyState < WebSocket.CLOSING) socket.close(1012, "Sequence gap; resync required");
+      else scheduleReconnect();
+    }
+
+    function scheduleReconnect() {
+      if (reconnectScheduled) return;
+      reconnectScheduled = true;
+      setReady(false);
+      status.textContent = "Disconnected — reconnecting...";
+      setTimeout(connect, reconnectDelay);
+      reconnectDelay = Math.min(reconnectDelay * 2, 10000);
+    }
+    connect();
+
+    undoButton.addEventListener("click", async () => {
+      if (!ready) return;
+      try {
+        pendingUndoId ??= crypto.randomUUID();
+        const response = await fetch("/undo", {
+          method: "POST", headers: {"X-Operation-ID": pendingUndoId},
+        });
+        if (response.status === 429) {
+          pendingUndoId = null;
+          status.textContent = "Maximum of ten undo attempts reached";
+          return;
+        }
+        if (!response.ok) throw new Error("Undo failed");
+        const result = await response.json();
+        pendingUndoId = null;
+        status.textContent = result.status === "skipped" ?
+          `Undo skipped; a newer update owns that pixel (${result.attempts_used}/10 attempts)` :
+          result.status === "empty" ? `Nothing to undo (${result.attempts_used}/10 attempts)` :
+          `Undo complete (${result.attempts_used}/10 attempts)`;
+      } catch (error) {
+        status.textContent = "Undo incomplete — reconnecting to refresh state";
+        if (socket) socket.close();
+      }
+    });
+
+
+    canvas.addEventListener("pointerdown", async (event) => {
+      if (!ready) return;
+      const rect = canvas.getBoundingClientRect();
+      const x = Math.floor(
+        (event.clientX - rect.left) / rect.width * 1000
+      );
+      const y = Math.floor(
+        (event.clientY - rect.top) / rect.height * 1000
+      );
+
+      const color = colorInput.value;
+      if (x < 0 || x >= 1000 || y < 0 || y >= 1000) return;
+
+      try {
+        const response = await fetch("/draw", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ x, y, color })
+        });
+
+        if (!response.ok) throw new Error("Drawing failed");
+
+        if (ready) status.textContent = `Painted (${x}, ${y})`;
+      } catch (error) {
+        status.textContent = "Error: " + error.message;
+      }
+    });
+
+    document.getElementById("clear").addEventListener(
+      "click", async () => {
+        if (!ready) return;
+        try {
+        pendingClearId ??= crypto.randomUUID();
+        const response = await fetch("/clear", {
+          method: "DELETE",
+          headers: { "X-Operation-ID": pendingClearId },
+        });
+
+        if (!response.ok) {
+          status.textContent = "Clear incomplete — reconnecting to refresh state";
+          socket.close();
+          return;
+        }
+
+        const data = await response.json();
+        status.textContent = `Cleared ${data.cleared} of your pixels`;
+        pendingClearId = null;
+        } catch (error) {
+          status.textContent = "Clear failed — reconnecting to refresh state";
+          socket.close();
+        }
+      }
+    );
+  </script>
+  </body>
+</html>
